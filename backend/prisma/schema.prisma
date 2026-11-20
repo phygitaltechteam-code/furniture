@@ -1,0 +1,2140 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                     String        @id @default(uuid())
+  username               String?
+  email                  String?
+  fullname               String
+  password               String?
+  refreshToken           String?
+  address                String?
+  isAccessClosed         Boolean       @default(false)
+  verifyCode             String?
+  verifyCodeExpiry       DateTime?
+  isVerified             Boolean       @default(false)
+  phoneNumber            String        @unique
+  secondaryPhoneNumber   String?
+  role                   Role          @default(ADMIN)
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+  deletedAt              DateTime?
+  companyId              String?
+  blockedAt              DateTime?
+  blockedById            String?
+  blockedReason          String?
+  lastLoginAt            DateTime?
+  mustChangePassword     Boolean       @default(false)
+  passwordResetExpiresAt DateTime?
+  passwordResetTokenHash String?       @unique
+  status                 AccountStatus @default(ACTIVE)
+  branchId               String?
+  shopId                 String?
+  createdById            String?
+  department             String?
+  employeeCode           String?       @unique
+  employeeRole           String?
+  jobTitle               String?
+  joiningDate            DateTime?
+  permissions            String[]      @default([])
+  /// Shop staff shift: FULL_DAY, MORNING, EVENING
+  shift                  String?
+  sessionsRevokedAt      DateTime?
+  /// Customer profile: WOMAN, MAN, OTHER (optional)
+  gender                 String?
+  dateOfBirth            DateTime?     @db.Date
+  photoUrl               String?
+  posPin                 String?
+  admin                  Admin?
+  branch                 Branch?       @relation(fields: [branchId], references: [id])
+  shop                   Shop?         @relation(fields: [shopId], references: [id])
+  company                Company?      @relation(fields: [companyId], references: [id])
+
+  orders               Order[]
+  createdProducts      Product[]            @relation("CreatedByUser")
+  stockAdjustments     StockAdjustment[]
+  assignedTasks        OrderTask[]
+  reviews              ProductReview[]
+  cart                 Cart?
+  wishlist             WishlistItem[]
+  addresses            CustomerAddress[]
+  returns              ReturnRequest[]
+  couponUsages         CouponUsage[]
+  orderStatusUpdates   OrderStatusHistory[]
+  purchaseBills        PurchaseBill[]
+  salesBills           SalesBill[]
+  salesBillsAsSalesman SalesBill[]          @relation("SalesBillSalesman")
+  creditNotes          CreditNote[]         @relation("CreditNoteCreatedBy")
+  decidedCreditNotes   CreditNote[]         @relation("CreditNoteDecidedBy")
+  salesReturns         SalesReturn[]        @relation("SalesReturnCreatedBy")
+  expenses             Expense[]            @relation("ExpenseCreatedBy")
+  attendances          Attendance[]         @relation("AttendanceUser")
+  notifications        Notification[]
+  supportRequests      SupportRequest[]
+  workOrdersAssigned   WorkOrder[]          @relation("WorkOrderAssignee")
+  deliveriesAssigned   Delivery[]           @relation("DeliveryAssignee")
+}
+
+model Admin {
+  id                  String     @id @default(uuid())
+  userId              String     @unique
+  amount              Float?
+  renewalAmount       Float?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+  accessType          accessType @default(OFFLINE)
+  city                String?
+  state               String?
+  country             String?
+  shopName            String?
+  district            String?
+  logo                String?
+  coverImage          String?
+  key                 String?
+  isUsedKey           Boolean    @default(false)
+  extendKey           String?
+  extendDays          Int?
+  isExtendUsedKey     Boolean?
+  BrandColour         String?
+  startDate           DateTime?
+  expiryDate          DateTime?
+  pincode             String?
+  contactPersonName   String?
+  contactPersonEmail  String?
+  contactPersonNumber String?
+  user                User       @relation(fields: [userId], references: [id])
+}
+
+model Company {
+  id                   String        @id @default(uuid())
+  name                 String
+  code                 String        @unique
+  email                String
+  contactNumber        String
+  address              String
+  logo                 String?
+  country              String        @default("India")
+  state                String
+  city                 String
+  postalCode           String
+  adminName            String
+  adminEmail           String
+  adminPhone           String
+  status               CompanyStatus @default(ACTIVE)
+  /// SINGLE_SHOP: a small business with one shop and a simple panel; the owner can switch up to BRANCHES
+  businessMode         BusinessMode  @default(BRANCHES)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  deletedAt            DateTime?
+  district             String?
+  /// Plan limits set by the super admin
+  maxBranches          Int           @default(3)
+  maxEmployees         Int           @default(25)
+  maxProducts          Int           @default(2000)
+  ecommerceEnabled     Boolean       @default(true)
+  manufacturingEnabled Boolean       @default(true)
+  branches             Branch[]
+  shops                Shop[]
+  users                User[]
+
+  categories    Category[]
+  brands        Brand[]
+  subcategories Subcategory[]
+  products      Product[]
+  orders        Order[]
+  returns       ReturnRequest[]
+  offers        Offer[]
+  coupons       Coupon[]
+  purchaseBills PurchaseBill[]
+  salesBills    SalesBill[]
+  creditNotes   CreditNote[]
+  customers     ShopCustomer[]
+  workOrders    WorkOrder[]
+  deliveries    Delivery[]
+  settings      CompanySettings?
+
+  @@index([name])
+  @@index([status])
+}
+
+/// Business rules the owner sets for the whole company (P4-08); no row = the defaults below
+model CompanySettings {
+  companyId           String   @id
+  company             Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /// Card / UPI refunds above this need the branch admin or owner (cash refunds always do)
+  refundApprovalLimit Float    @default(2000)
+  /// Bills with a discount above this % of the bill are flagged for the branch
+  discountApprovalPct Float    @default(10)
+  /// Low-stock level for new stock rows and the product list's "Low stock" filter
+  lowStockDefault     Int      @default(5)
+  /// Credit days for a new credit customer when none are given
+  defaultCreditDays   Int      @default(15)
+  /// Products below this margin are flagged on the branch price list
+  minMarginPct        Float    @default(25)
+  updatedAt           DateTime @updatedAt
+}
+
+model RolePermission {
+  role       Role
+  permission String
+  createdAt  DateTime @default(now())
+
+  @@id([role, permission])
+}
+
+model AuditLog {
+  id        String      @id @default(uuid())
+  actorId   String?
+  actorName String?
+  actorRole Role?
+  action    String
+  module    String
+  targetId  String?
+  companyId String?
+  result    AuditResult @default(SUCCESS)
+  reason    String?
+  before    Json?
+  after     Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime    @default(now())
+
+  @@index([module, createdAt])
+  @@index([actorId])
+  @@index([companyId])
+  @@index([targetId])
+}
+
+model Branch {
+  id             String       @id @default(uuid())
+  code           String       @unique
+  name           String
+  companyId      String
+  email          String?
+  phone          String?
+  alternatePhone String?
+  address        String
+  postalCode     String
+  state          String
+  district       String
+  city           String
+  country        String       @default("India")
+  openingTime    String?
+  closingTime    String?
+  weeklyHolidays String[]     @default([])
+  notes          String?
+  status         BranchStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  deletedAt      DateTime?
+  company        Company      @relation(fields: [companyId], references: [id])
+  users          User[]
+  shops          Shop[]
+
+  inventory      Inventory[]
+  orders         Order[]
+  stockMovements StockMovement[]
+  offers         Offer[]
+  coupons        Coupon[]
+  purchaseBills  PurchaseBill[]
+  salesBills     SalesBill[]
+  creditNotes    CreditNote[]
+  customers      ShopCustomer[]
+  workOrders     WorkOrder[]
+  deliveries     Delivery[]
+
+  /// The business lines this branch deals in
+  businessLines  BusinessLine[] @default([FURNITURE, ELECTRONICS, CROCKERY])
+
+  @@index([companyId])
+  @@index([status])
+}
+
+/// The branch's operating outlet (exactly one per branch, created with the branch).
+/// Billing, the cash drawer and staff are scoped to it; it is never shown as a separate level.
+model Shop {
+  id              String                  @id @default(uuid())
+  code            String                  @unique
+  name            String
+  /// SHOWROOM, FACTORY_OUTLET, WAREHOUSE_STORE
+  shopType        String?
+  companyId       String
+  branchId        String
+  email           String?
+  phone           String?
+  address         String?
+  /// GST registration shown on bills and the shop header
+  gstin           String?
+  /// Sales bill series prefix, e.g. WW -> WW/26-27/00001 (falls back to the shop code)
+  billPrefix      String?
+  /// GST price rule and allowed slabs (D-18): {threshold, rateUpTo, rateAbove, slabs}; null = defaults
+  gstRule         Json?
+  openingTime     String?
+  closingTime     String?
+  notes           String?
+  status          ShopStatus              @default(ACTIVE)
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+  deletedAt       DateTime?
+  company         Company                 @relation(fields: [companyId], references: [id])
+  branch          Branch                  @relation(fields: [branchId], references: [id])
+  users           User[]
+  products        Product[]
+  offers          Offer[]
+  coupons         Coupon[]
+  orders          Order[]
+  returns         ReturnRequest[]
+  purchaseBills   PurchaseBill[]
+  salesBills      SalesBill[]
+  creditNotes     CreditNote[]
+  salesReturns    SalesReturn[]
+  counterSessions CounterSession[]
+  cashEntries     CashEntry[]
+  attendances     Attendance[]
+  staffRequests   StaffRequest[]
+  transfersOut    StockTransfer[]         @relation("TransferFromShop")
+  transfersIn     StockTransfer[]         @relation("TransferToShop")
+  expenses        Expense[]
+  customers       ShopCustomer[]
+  creditPayments  CustomerCreditPayment[]
+  purchaseReturns PurchaseReturn[]
+  quotations      Quotation[]
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([status])
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  /// Runs one branch: billing, stock, staff, manufacturing, deliveries
+  BRANCH_MANAGER
+  EMPLOYEE
+  /// Storefront customer
+  USER
+}
+
+enum AccountStatus {
+  PENDING_INVITATION
+  ACTIVE
+  INACTIVE
+  BLOCKED
+}
+
+enum accessType {
+  ONLINE
+  OFFLINE
+}
+
+enum CompanyStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum BusinessMode {
+  SINGLE_SHOP
+  BRANCHES
+}
+
+enum AuditResult {
+  SUCCESS
+  FAILURE
+}
+
+enum BranchStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ShopStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// -------------------------------------------------------------
+// FURNITURE CATALOG & MULTI-BRANCH INVENTORY MODELS
+// -------------------------------------------------------------
+
+model Category {
+  id            String        @id @default(uuid())
+  companyId     String?
+  company       Company?      @relation(fields: [companyId], references: [id])
+  name          String
+  code          String        @unique
+  description   String?
+  image         String?
+  parentId      String?
+  parent        Category?     @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children      Category[]    @relation("CategoryHierarchy")
+  displayOrder  Int           @default(0)
+  seoTitle      String?
+  seoDesc       String?
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  products      Product[]
+  offers        Offer[]
+  subcategories Subcategory[]
+
+  @@index([companyId])
+  @@index([code])
+}
+
+model Brand {
+  id          String    @id @default(uuid())
+  companyId   String?
+  company     Company?  @relation(fields: [companyId], references: [id])
+  name        String
+  code        String    @unique
+  logo        String?
+  description String?
+  website     String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  products    Product[]
+
+  @@index([companyId])
+  @@index([code])
+}
+
+model Subcategory {
+  id           String    @id @default(uuid())
+  /// null = platform-wide (super admin); otherwise one company's own
+  companyId    String?
+  company      Company?  @relation(fields: [companyId], references: [id])
+  categoryId   String
+  category     Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  name         String
+  code         String    @unique
+  description  String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  products     Product[]
+  offers       Offer[]
+
+  @@index([categoryId])
+  @@index([companyId])
+  @@index([code])
+}
+
+enum ProductKind {
+  FINISHED_GOOD
+  RAW_MATERIAL
+  HARDWARE
+  SERVICE
+}
+
+enum ProductStatus {
+  DRAFT
+  PENDING_REVIEW
+  PUBLISHED
+  UNPUBLISHED
+  ARCHIVED
+}
+
+model Product {
+  id            String        @id @default(uuid())
+  companyId     String
+  company       Company       @relation(fields: [companyId], references: [id])
+  categoryId    String
+  category      Category      @relation(fields: [categoryId], references: [id])
+  brandId       String?
+  brand         Brand?        @relation(fields: [brandId], references: [id])
+  // Shop-side products: owning shop + master subcategory (null for company catalog products)
+  shopId        String?
+  shop          Shop?         @relation(fields: [shopId], references: [id])
+  subcategoryId String?
+  subcategory   Subcategory?  @relation(fields: [subcategoryId], references: [id])
+  stockQuantity Int           @default(0)
+  name          String
+  sku           String        @unique
+  shortDesc     String?
+  detailedDesc  String?
+  tags          String[]      @default([])
+  /// FINISHED_GOOD (sold), RAW_MATERIAL (used in manufacturing), HARDWARE, SERVICE
+  productKind   ProductKind   @default(FINISHED_GOOD)
+  /// Furniture, Electronics or Crockery (kitchen utensils)
+  businessLine  BusinessLine  @default(FURNITURE)
+  /// TRADED (bought and resold), MANUFACTURED (made in our workshop for stock), MADE_TO_ORDER (built per customer)
+  sourcing      Sourcing      @default(TRADED)
+  bomLines      BomLine[]     @relation("BomProduct")
+  workOrders    WorkOrder[]
+  /// e.g. Sofa, Bed, Wardrobe, Dining Table, Ceiling Fan, Cookware Set
+  productType   String?
+  status        ProductStatus @default(DRAFT)
+
+  // Furniture attributes
+  /// Living Room, Bedroom, Dining, Office, Kitchen, Outdoor
+  roomType              String?
+  /// Sheesham, Teak, Engineered Wood, Plywood, Metal, Glass...
+  material              String?
+  /// Natural, Walnut, Honey, Matte, Glossy, Laminate...
+  finish                String?
+  colour                String?
+  lengthCm              Float?
+  widthCm               Float?
+  heightCm              Float?
+  /// Seats, storage, load capacity... as key/value pairs
+  specifications        Json?
+  assemblyRequired      Boolean @default(false)
+  installationAvailable Boolean @default(false)
+  warrantyMonths        Int     @default(0)
+  warrantyTerms         String?
+  /// Can be ordered made-to-measure from the configurator
+  isCustomizable        Boolean @default(false)
+  /// PCS, SET, SQFT, RFT, KG, SHEET, LTR, MTR
+  unit                  String  @default("PCS")
+  careInstructions      String?
+  countryOfOrigin       String? @default("India")
+
+  // Pricing & Tax
+  mrp            Float     @default(0)
+  sellingPrice   Float     @default(0)
+  /// Price for wholesale / dealer bills (0 = use the selling price)
+  wholesalePrice Float     @default(0)
+  /// Last purchase / manufacturing cost per unit
+  purchasePrice  Float     @default(0)
+  /// Last time the selling price was changed (branch pricing)
+  priceChangedAt DateTime?
+  /// Fixed GST rate of this product; null = the shop's GST price rule (Shop.gstRule, D-18)
+  taxRate        Float?
+  /// HSN code printed on bills, invoices and debit notes (4, 6 or 8 digits)
+  hsnCode        String?
+  currency       String    @default("INR")
+
+  // Shipping specifications
+  weightKg         Float?
+  dimensions       String? // L x W x H in cm
+  returnEligible   Boolean @default(true)
+  returnPeriodDays Int     @default(7)
+
+  // SEO metadata
+  seoTitle String?
+  seoDesc  String?
+  slug     String? @unique
+
+  createdById String?
+  createdBy   User?   @relation("CreatedByUser", fields: [createdById], references: [id])
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  images            ProductImage[]
+  variants          ProductVariant[]
+  reviews           ProductReview[]
+  orderItems        OrderItem[]
+  cartItems         CartItem[]
+  wishlistedBy      WishlistItem[]
+  quotationItems    QuotationItem[]
+  offers            Offer[]
+  purchaseBillItems PurchaseBillItem[]
+  salesBillItems    SalesBillItem[]
+  creditNoteItems   CreditNoteItem[]
+
+  @@index([companyId])
+  @@index([categoryId])
+  @@index([brandId])
+  @@index([status])
+  @@index([shopId])
+  @@index([subcategoryId])
+}
+
+model ProductImage {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  altText   String?
+  order     Int      @default(0)
+  isMain    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+}
+
+model ProductVariant {
+  id             String          @id @default(uuid())
+  productId      String
+  product        Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantSku     String          @unique
+  /// Configuration / size, e.g. "3 Seater", "King 6x6.5 ft", "Standard"
+  variantName    String
+  /// Finish or colour, e.g. "Walnut", "Teak Natural", "Grey Fabric"
+  finish         String
+  barcode        String?         @unique
+  image          String?
+  mrp            Float?
+  sellingPrice   Float?
+  wholesalePrice Float?
+  quotationItems QuotationItem[]
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  inventories       Inventory[]
+  orderItems        OrderItem[]
+  bomUsages         BomLine[]           @relation("BomMaterial")
+  workOrderOutputs  WorkOrder[]         @relation("WorkOrderOutput")
+  workOrderUsages   WorkOrderMaterial[]
+  cartItems         CartItem[]
+  stockMovements    StockMovement[]
+  purchaseBillItems PurchaseBillItem[]
+  salesBillItems    SalesBillItem[]
+  creditNoteItems   CreditNoteItem[]
+
+  @@index([productId])
+}
+
+model Inventory {
+  id          String         @id @default(uuid())
+  branchId    String
+  branch      Branch         @relation(fields: [branchId], references: [id])
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  physicalQty Int            @default(0)
+  reservedQty Int            @default(0)
+  threshold   Int            @default(5)
+  damagedQty  Int            @default(0)
+  /// Where it sits in the store / godown, e.g. "R-03 / Shelf B"
+  rackNo      String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@unique([branchId, variantId])
+  @@index([branchId])
+  @@index([variantId])
+}
+
+enum MovementType {
+  PURCHASE_IN
+  SALE_OUT
+  ADJUSTMENT_INCREASE
+  ADJUSTMENT_DECREASE
+  RETURN_RESTOCK
+  DAMAGE_WRITE_OFF
+  TRANSFER_OUT
+  TRANSFER_IN
+  PURCHASE_REVERSAL // stock out: purchase bill reduced / cancelled
+  SALE_REVERSAL // stock in: sales bill reduced / cancelled
+  PRODUCTION_ISSUE // raw material out to a work order
+  PRODUCTION_RETURN // unused raw material back from a work order
+  PRODUCTION_IN // finished goods in from a completed work order
+}
+
+/// What created a stock movement (null for legacy rows)
+enum StockSourceType {
+  PURCHASE_BILL
+  SALES_BILL
+  ORDER
+  RETURN
+  ADJUSTMENT
+  TRANSFER
+  WORK_ORDER
+}
+
+model StockMovement {
+  id            String           @id @default(uuid())
+  branchId      String
+  branch        Branch           @relation(fields: [branchId], references: [id])
+  variantId     String
+  variant       ProductVariant   @relation(fields: [variantId], references: [id])
+  type          MovementType
+  quantity      Int
+  prevPhysical  Int
+  newPhysical   Int
+  reason        String
+  reference     String?
+  sourceType    StockSourceType?
+  sourceId      String?
+  performedById String?
+  createdAt     DateTime         @default(now())
+
+  @@index([branchId])
+  @@index([variantId])
+  @@index([sourceType, sourceId])
+}
+
+// -------------------------------------------------------------
+// SHOP BILLING: purchase bills (stock in) & sales bills (stock out)
+// Stock is posted only for CONFIRMED bills, via inventoryService.applyStockChanges
+// -------------------------------------------------------------
+
+enum BillStatus {
+  DRAFT
+  CONFIRMED
+  CANCELLED
+}
+
+model PurchaseBill {
+  id                  String            @id @default(uuid())
+  billNumber          String
+  companyId           String
+  company             Company           @relation(fields: [companyId], references: [id])
+  branchId            String
+  branch              Branch            @relation(fields: [branchId], references: [id])
+  shopId              String
+  shop                Shop              @relation(fields: [shopId], references: [id])
+  supplierName        String
+  supplierInvoiceNo   String?
+  supplierPhone       String?
+  billDate            DateTime          @default(now())
+  status              BillStatus        @default(CONFIRMED)
+  subtotal            Float             @default(0)
+  taxAmount           Float             @default(0)
+  discount            Float             @default(0)
+  totalAmount         Float             @default(0)
+  /// Paid to the supplier so far; balanceDue = totalAmount - amountPaid
+  amountPaid          Float             @default(0)
+  balanceDue          Float             @default(0)
+  paymentStatus       BillPaymentStatus @default(PAID)
+  dueDate             DateTime?
+  notes               String?
+  /// Optimistic lock: bumped on every change so concurrent edits can't post stock twice
+  version             Int               @default(0)
+  createdById         String
+  createdBy           User              @relation(fields: [createdById], references: [id])
+  cancelledAt         DateTime?
+  cancelReason        String?
+  deletedAt           DateTime?
+  /// An employee asked to delete this bill (D-16); the shop admin or owner deletes it or keeps it
+  deleteRequestedAt   DateTime?
+  deleteRequestedById String?
+  deleteRequestReason String?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  items    PurchaseBillItem[]
+  payments PurchaseBillPayment[]
+  returns  PurchaseReturn[]
+
+  @@unique([shopId, billNumber])
+  @@index([shopId])
+  @@index([status])
+  @@index([billDate])
+}
+
+model PurchaseBillItem {
+  id        String         @id @default(uuid())
+  billId    String
+  bill      PurchaseBill   @relation(fields: [billId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product        @relation(fields: [productId], references: [id])
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+  quantity  Int
+  unitCost  Float
+  taxRate   Float          @default(0)
+  /// The product's HSN when the line was saved
+  hsnCode   String?
+  totalCost Float
+
+  @@index([billId])
+  @@index([variantId])
+}
+
+model SalesBill {
+  id            String     @id @default(uuid())
+  billNumber    String
+  companyId     String
+  company       Company    @relation(fields: [companyId], references: [id])
+  branchId      String
+  branch        Branch     @relation(fields: [branchId], references: [id])
+  shopId        String
+  shop          Shop       @relation(fields: [shopId], references: [id])
+  customerName  String?
+  customerPhone String?
+  billDate      DateTime   @default(now())
+  status        BillStatus @default(CONFIRMED)
+  paymentMethod String     @default("CASH") // CASH, CARD, UPI, CREDIT
+
+  subtotal         Float             @default(0)
+  discount         Float             @default(0)
+  taxAmount        Float             @default(0)
+  totalAmount      Float             @default(0)
+  /// Money received at billing; the rest is owed by the customer
+  paidAmount       Float             @default(0)
+  creditAmount     Float             @default(0)
+  /// Edits made after the bill was confirmed
+  editCount        Int               @default(0)
+  lastEditedAt     DateTime?
+  /// true: unit prices include GST (the tag price); false: GST was added on top (bills before Nov 2026)
+  pricesIncludeTax Boolean           @default(false)
+  /// Total rounded to the rupee: roundOff = totalAmount - (subtotal + taxAmount)
+  roundOff         Float             @default(0)
+  /// Collected so far (at billing + later collections); balanceDue is the customer's credit
+  amountPaid       Float             @default(0)
+  balanceDue       Float             @default(0)
+  paymentStatus    BillPaymentStatus @default(PAID)
+  dueDate          DateTime?
+  billType         SalesBillType     @default(TAX_INVOICE_B2C)
+  /// RETAIL or WHOLESALE (wholesale bills use the wholesale price)
+  saleType         String            @default("RETAIL")
+  /// Set when the bill was made from a quotation
+  quotationId      String?           @unique
+  quotation        Quotation?        @relation(fields: [quotationId], references: [id])
+  /// Buyer's GST number, required on B2B tax invoices (stored uppercase)
+  customerGstin    String?
+  /// Staff member who made the sale (commission / incentives); createdBy is the cashier
+  salesmanId       String?
+  salesman         User?             @relation("SalesBillSalesman", fields: [salesmanId], references: [id], onDelete: SetNull)
+
+  notes               String?
+  version             Int       @default(0)
+  createdById         String
+  createdBy           User      @relation(fields: [createdById], references: [id])
+  cancelledAt         DateTime?
+  cancelReason        String?
+  deletedAt           DateTime?
+  /// An employee asked to delete this bill (D-16); the shop admin or owner deletes it or keeps it
+  deleteRequestedAt   DateTime?
+  deleteRequestedById String?
+  deleteRequestReason String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  items       SalesBillItem[]
+  creditNotes CreditNote[]
+  payments    SalesBillPayment[]
+  returns     SalesReturn[]
+
+  workOrders     WorkOrder[]
+  deliveries     Delivery[]
+  @@unique([shopId, billNumber])
+  @@index([shopId])
+  @@index([status])
+  @@index([billDate])
+  @@index([createdById])
+  @@index([salesmanId])
+}
+
+model SalesBillItem {
+  id          String            @id @default(uuid())
+  billId      String
+  bill        SalesBill         @relation(fields: [billId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product           @relation(fields: [productId], references: [id])
+  variantId   String
+  variant     ProductVariant    @relation(fields: [variantId], references: [id])
+  quantity    Int
+  unitPrice   Float
+  discount    Float             @default(0)
+  taxRate     Float             @default(0)
+  /// The product's HSN when the line was saved
+  hsnCode     String?
+  totalPrice  Float
+  productName String?
+  variantSku  String?
+  variantName String?
+  finish      String?
+  returnItems SalesReturnItem[]
+
+  creditNoteItems CreditNoteItem[]
+
+  @@index([billId])
+  @@index([variantId])
+}
+
+enum BillPaymentStatus {
+  PAID
+  PART_CREDIT
+  CREDIT
+}
+
+enum SalesBillType {
+  TAX_INVOICE_B2C
+  TAX_INVOICE_B2B
+  RETAIL_INVOICE
+}
+
+/// Money received against a sales bill: at billing time or a later due collection
+model SalesBillPayment {
+  id           String    @id @default(uuid())
+  billId       String
+  bill         SalesBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  mode         String // CASH, UPI, CARD
+  amount       Float
+  paidAt       DateTime  @default(now())
+  receivedById String
+  note         String?
+  /// UPI reference or the card's last 4 digits
+  reference    String?
+  /// true = taken when the bill was saved (replaced on edit); false = a later due collection
+  atBilling    Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  @@index([billId])
+  @@index([paidAt])
+}
+
+/// Money paid to the supplier against a purchase bill
+model PurchaseBillPayment {
+  id        String       @id @default(uuid())
+  billId    String
+  bill      PurchaseBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  mode      String // CASH, UPI, CARD
+  amount    Float
+  paidAt    DateTime     @default(now())
+  paidById  String
+  note      String?
+  /// true = paid when the bill was saved (replaced on edit); false = a later payment
+  atBilling Boolean      @default(true)
+  createdAt DateTime     @default(now())
+
+  @@index([billId])
+  @@index([paidAt])
+}
+
+/// Credit note: goods returned against a confirmed sales bill (stock is restocked)
+model SalesReturn {
+  id            String    @id @default(uuid())
+  returnNumber  String
+  companyId     String
+  branchId      String
+  shopId        String
+  shop          Shop      @relation(fields: [shopId], references: [id])
+  salesBillId   String
+  salesBill     SalesBill @relation(fields: [salesBillId], references: [id])
+  customerName  String?
+  customerPhone String?
+  returnDate    DateTime  @default(now())
+  totalAmount   Float
+  /// CASH, UPI, CARD (refunded), STORE_CREDIT, or ADJUST_DUE (reduces the bill's balance)
+  refundMode    String
+  reason        String?
+  createdById   String
+  createdBy     User      @relation("SalesReturnCreatedBy", fields: [createdById], references: [id])
+  createdAt     DateTime  @default(now())
+
+  items SalesReturnItem[]
+
+  @@unique([shopId, returnNumber])
+  @@index([shopId])
+  @@index([salesBillId])
+  @@index([returnDate])
+}
+
+model SalesReturnItem {
+  id              String        @id @default(uuid())
+  returnId        String
+  salesReturn     SalesReturn   @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  salesBillItemId String
+  salesBillItem   SalesBillItem @relation(fields: [salesBillItemId], references: [id])
+  productId       String
+  variantId       String
+  quantity        Int
+  unitPrice       Float
+  totalPrice      Float
+
+  @@index([returnId])
+  @@index([salesBillItemId])
+}
+
+/// A counter day: the opening cash in the drawer, until it is closed
+model CounterSession {
+  id               String      @id @default(uuid())
+  shopId           String
+  shop             Shop        @relation(fields: [shopId], references: [id])
+  openedAt         DateTime    @default(now())
+  openingCash      Float
+  openedById       String
+  closedAt         DateTime?
+  closingCash      Float?
+  closedById       String?
+  /// Notes counted at day close, e.g. {"500": 6, "200": 6}
+  denominations    Json?
+  expectedCash     Float?
+  difference       Float?
+  differenceReason String?
+  /// Branch admin review of a difference: ACCEPTED (null = not reviewed)
+  reviewStatus     String?
+  reviewAction     String?
+  reviewNote       String?
+  depositAmount    Float?
+  keptFloat        Float?
+  cashEntries      CashEntry[]
+
+  @@index([shopId, closedAt])
+  @@index([shopId, openedAt])
+}
+
+/// Manual cash movement at the counter: cash in / out, or a bank deposit
+model CashEntry {
+  id          String          @id @default(uuid())
+  shopId      String
+  shop        Shop            @relation(fields: [shopId], references: [id])
+  sessionId   String?
+  session     CounterSession? @relation(fields: [sessionId], references: [id])
+  type        String // IN, OUT, BANK_DEPOSIT
+  amount      Float
+  particulars String
+  reference   String?
+  bankName    String?
+  createdById String
+  createdAt   DateTime        @default(now())
+
+  @@index([shopId, createdAt])
+  @@index([sessionId])
+}
+
+/// Branch admin's bank deposit of the day's cash handed over by the shops
+model BankDeposit {
+  id          String   @id @default(uuid())
+  companyId   String
+  branchId    String
+  depositDate DateTime @db.Date
+  amount      Float
+  bank        String
+  reference   String?
+  slipUrl     String?
+  createdById String
+  createdAt   DateTime @default(now())
+
+  @@index([branchId, depositDate])
+}
+
+/// A staff member's day at the shop
+model Attendance {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation("AttendanceUser", fields: [userId], references: [id])
+  shopId     String
+  shop       Shop      @relation(fields: [shopId], references: [id])
+  /// Calendar day (IST), stored as a date
+  date       DateTime  @db.Date
+  status     String // IN, OUT, LEAVE, ABSENT
+  inAt       DateTime?
+  outAt      DateTime?
+  markedById String?
+  note       String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([userId, date])
+  @@index([shopId, date])
+}
+
+/// A shop asks the branch admin for a new staff member
+model StaffRequest {
+  id            String    @id @default(uuid())
+  requestNumber String    @unique
+  companyId     String
+  branchId      String
+  shopId        String
+  shop          Shop      @relation(fields: [shopId], references: [id])
+  fullname      String
+  phoneNumber   String
+  email         String?
+  employeeRole  String
+  shift         String
+  permissions   String[]  @default([])
+  note          String?
+  status        String    @default("PENDING") // PENDING, APPROVED, REJECTED
+  decidedById   String?
+  decidedAt     DateTime?
+  decisionNote  String?
+  createdUserId String?
+  createdById   String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([branchId, status])
+  @@index([shopId])
+}
+
+/// Stock moved between two shops of a branch:
+/// REQUESTED -> APPROVED (branch admin) -> DISPATCHED (source shop) -> RECEIVED / SHORT (requesting shop)
+model StockTransfer {
+  id             String    @id @default(uuid())
+  transferNumber String
+  companyId      String
+  branchId       String
+  /// null while the request is for "any shop in the branch"; set on approval
+  fromShopId     String?
+  fromShop       Shop?     @relation("TransferFromShop", fields: [fromShopId], references: [id])
+  toShopId       String
+  toShop         Shop      @relation("TransferToShop", fields: [toShopId], references: [id])
+  status         String    @default("REQUESTED")
+  reason         String
+  note           String?
+  neededBy       DateTime?
+  requestedById  String
+  approvedById   String?
+  approvedAt     DateTime?
+  rejectReason   String?
+  dispatchedById String?
+  dispatchedAt   DateTime?
+  receivedById   String?
+  receivedAt     DateTime?
+  receiveNote    String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  items StockTransferItem[]
+
+  @@unique([branchId, transferNumber])
+  @@index([branchId, status])
+  @@index([fromShopId])
+  @@index([toShopId])
+}
+
+model StockTransferItem {
+  id              String        @id @default(uuid())
+  transferId      String
+  transfer        StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  /// The requesting shop's variant (stock comes in here); null until a product the
+  /// shop does not carry yet is copied into it on receipt
+  destVariantId   String?
+  /// The source shop's matching variant (stock goes out from here), set on approval
+  sourceVariantId String?
+  productName     String
+  variantSku      String
+  variantName     String
+  finish          String
+  requestedQty    Int
+  approvedQty     Int?
+  dispatchedQty   Int?
+  receivedQty     Int?
+
+  @@index([transferId])
+}
+
+/// Shop running expense; cash expenses reduce the drawer
+model Expense {
+  id            String   @id @default(uuid())
+  /// Per shop: EX/26-27/0001 (unique within the shop)
+  expenseNumber String?
+  companyId     String
+  branchId      String
+  /// null = a branch-level expense (rent, salaries) not charged to one shop
+  shopId        String?
+  shop          Shop?    @relation(fields: [shopId], references: [id])
+  expenseDate   DateTime @default(now())
+  category      String
+  head          String?
+  description   String?
+  amount        Float
+  mode          String // CASH, UPI, CARD
+  paidBy        String? // Cash from counter, UPI, Bank
+  gstAmount     Float?   @default(0)
+  photoUrl      String?
+  notes         String?
+  createdById   String
+  createdBy     User     @relation("ExpenseCreatedBy", fields: [createdById], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@unique([shopId, expenseNumber])
+  @@index([shopId, expenseDate])
+  @@index([branchId, expenseDate])
+}
+
+model StockAdjustment {
+  id               String    @id @default(uuid())
+  adjustmentNumber String?
+  reference        String?
+  photoUrl         String?
+  branchId         String
+  shopId           String?
+  companyId        String?
+  variantId        String
+  type             String // INCREASE, DECREASE, MARK_DAMAGED, WRITE_OFF
+  quantity         Int
+  availableBefore  Int       @default(0)
+  availableAfter   Int       @default(0)
+  damagedBefore    Int       @default(0)
+  damagedAfter     Int       @default(0)
+  reason           String
+  notes            String?
+  approvalStatus   String    @default("AUTO") // AUTO, APPROVED, PENDING, REJECTED
+  approvedById     String?
+  approvedAt       DateTime?
+  createdById      String
+  createdBy        User      @relation(fields: [createdById], references: [id])
+  createdAt        DateTime  @default(now())
+
+  @@index([branchId, createdAt])
+  @@index([variantId])
+  @@index([adjustmentNumber])
+}
+
+// -------------------------------------------------------------
+// ORDERS, PAYMENTS, SHIPMENTS & RETURNS
+// -------------------------------------------------------------
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  PACKED
+  READY_FOR_DISPATCH
+  DISPATCHED
+  SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  RETURNED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum ReturnStatus {
+  REQUESTED
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  RECEIVED
+  COMPLETED
+}
+
+enum RefundStatus {
+  NONE
+  PENDING
+  APPROVED
+  PROCESSED
+  REJECTED
+}
+
+model Order {
+  id          String  @id @default(uuid())
+  orderNumber String  @unique
+  customerId  String
+  customer    User    @relation(fields: [customerId], references: [id])
+  companyId   String
+  company     Company @relation(fields: [companyId], references: [id])
+  branchId    String
+  branch      Branch  @relation(fields: [branchId], references: [id])
+  shopId      String?
+  shop        Shop?   @relation(fields: [shopId], references: [id])
+
+  status        OrderStatus   @default(PENDING)
+  paymentStatus PaymentStatus @default(PENDING)
+  paymentMethod String        @default("COD")
+
+  subtotal       Float
+  discount       Float @default(0)
+  couponDiscount Float @default(0)
+  tax            Float @default(0)
+  shippingFee    Float @default(0)
+  totalAmount    Float
+
+  shippingAddress Json
+  courierName     String?
+  trackingNumber  String?
+  notes           String?
+
+  // Customer cancellation management
+  cancelReason          String?
+  cancelRequested       Boolean   @default(false)
+  cancelRequestedAt     DateTime?
+  cancelApproved        Boolean?
+  cancelRejectionReason String?
+
+  paymentDetails Json?
+
+  /// GST invoice number from the shop's online series, e.g. WW/26-27/O0001 (D-20); set when paid or confirmed
+  invoiceNumber String?
+  invoiceDate   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items         OrderItem[]
+  tasks         OrderTask[]
+  returns       ReturnRequest[]
+  statusHistory OrderStatusHistory[]
+  couponCode    String?
+  couponUsages  CouponUsage[]
+
+  workOrders     WorkOrder[]
+  deliveries     Delivery[]
+  @@unique([shopId, invoiceNumber])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([shopId])
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id          String         @id @default(uuid())
+  orderId     String
+  order       Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product        @relation(fields: [productId], references: [id])
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  quantity    Int
+  unitPrice   Float
+  totalPrice  Float
+  /// GST rate and HSN when the order was placed (the invoice prints these)
+  taxRate     Float?
+  hsnCode     String?
+  productName String?
+  variantSku  String?
+  variantName String?
+  finish      String?
+  image       String?
+}
+
+model OrderStatusHistory {
+  id          String      @id @default(uuid())
+  orderId     String
+  order       Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status      OrderStatus
+  comment     String?
+  updatedById String?
+  updatedBy   User?       @relation(fields: [updatedById], references: [id])
+  createdAt   DateTime    @default(now())
+
+  @@index([orderId])
+  @@index([createdAt])
+}
+
+model OrderTask {
+  id           String    @id @default(uuid())
+  orderId      String
+  order        Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  assignedToId String
+  assignedTo   User      @relation(fields: [assignedToId], references: [id])
+  task         String // e.g., Pick & Pack, Quality Check, Dispatch
+  isCompleted  Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  completedAt  DateTime?
+}
+
+model ReturnRequest {
+  id           String       @id @default(uuid())
+  orderId      String
+  order        Order        @relation(fields: [orderId], references: [id])
+  customerId   String
+  customer     User         @relation(fields: [customerId], references: [id])
+  companyId    String
+  company      Company      @relation(fields: [companyId], references: [id])
+  shopId       String?
+  shop         Shop?        @relation(fields: [shopId], references: [id])
+  reason       String
+  description  String?
+  returnStatus ReturnStatus @default(REQUESTED)
+  refundAmount Float?
+  refundStatus RefundStatus @default(NONE)
+  notes        String?
+  returnItems  Json?
+  /// What the customer wants: REFUND or EXCHANGE
+  resolution   String       @default("REFUND")
+  /// Variant / finish wanted for an exchange or replacement
+  exchangeFor  String?
+  images       String[]     @default([])
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@index([orderId])
+  @@index([companyId])
+  @@index([shopId])
+}
+
+model CustomerAddress {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  recipient  String
+  phone      String
+  address1   String
+  address2   String?
+  city       String
+  district   String?
+  state      String
+  postalCode String
+  country    String   @default("India")
+  /// HOME, WORK or OTHER
+  label      String   @default("HOME")
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Cart {
+  id        String     @id @default(uuid())
+  userId    String     @unique
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  items     CartItem[]
+}
+
+/// A product a customer saved for later (storefront wishlist)
+model WishlistItem {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId])
+  @@index([userId])
+}
+
+model CartItem {
+  id        String         @id @default(uuid())
+  cartId    String
+  cart      Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product        @relation(fields: [productId], references: [id])
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+  quantity  Int            @default(1)
+  createdAt DateTime       @default(now())
+}
+
+model ProductReview {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  rating    Int      @default(5)
+  title     String?
+  comment   String?
+  images    String[] @default([])
+  createdAt DateTime @default(now())
+}
+
+// -------------------------------------------------------------
+// OFFERS & PROMOTIONS MANAGEMENT MODELS
+// -------------------------------------------------------------
+
+enum OfferType {
+  PERCENTAGE
+  FLAT
+}
+
+enum OfferApplicableOn {
+  ALL_PRODUCTS
+  SELECTED_CATEGORIES
+  SELECTED_SUBCATEGORIES
+  SELECTED_PRODUCTS
+}
+
+model Offer {
+  id               String            @id @default(uuid())
+  name             String
+  description      String?
+  bannerUrl        String?
+  type             OfferType         @default(PERCENTAGE)
+  discountValue    Float
+  applicableOn     OfferApplicableOn @default(ALL_PRODUCTS)
+  minOrderValue    Float             @default(0)
+  maxDiscountLimit Float?
+  startDate        DateTime
+  endDate          DateTime
+  isActive         Boolean           @default(true)
+  priority         Int               @default(0)
+
+  // Scope: optional company/branch/shop ties
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id])
+  branchId  String?
+  branch    Branch?  @relation(fields: [branchId], references: [id])
+  shopId    String?
+  shop      Shop?    @relation(fields: [shopId], references: [id])
+
+  // Relations for specific scopes
+  categories    Category[]
+  subcategories Subcategory[]
+  products      Product[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([shopId])
+  @@index([isActive])
+  @@index([startDate, endDate])
+}
+
+model Coupon {
+  id                String    @id @default(uuid())
+  code              String    @unique
+  name              String?
+  description       String?
+  bannerUrl         String?
+  type              OfferType @default(PERCENTAGE)
+  discountValue     Float
+  minPurchaseAmount Float     @default(0)
+  maxDiscountLimit  Float?
+  usageLimit        Int? // Total allowed uses across all users (null = unlimited)
+  perCustomerLimit  Int       @default(1) // Uses per individual customer
+  usedCount         Int       @default(0)
+  startDate         DateTime
+  endDate           DateTime
+  isActive          Boolean   @default(true)
+
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id])
+  branchId  String?
+  branch    Branch?  @relation(fields: [branchId], references: [id])
+  shopId    String?
+  shop      Shop?    @relation(fields: [shopId], references: [id])
+
+  usages CouponUsage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([code])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([shopId])
+  @@index([isActive])
+  @@index([startDate, endDate])
+}
+
+model CouponUsage {
+  id             String   @id @default(uuid())
+  couponId       String
+  coupon         Coupon   @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  orderId        String?
+  order          Order?   @relation(fields: [orderId], references: [id])
+  discountAmount Float
+  usedAt         DateTime @default(now())
+
+  @@index([couponId])
+  @@index([userId])
+  @@index([orderId])
+}
+
+// -------------------------------------------------------------
+// SALES RETURNS: credit notes against confirmed POS sales bills.
+// Cash refunds and refunds above the approval limit wait for the branch admin.
+// -------------------------------------------------------------
+
+enum ReturnSettlement {
+  REFUND
+  EXCHANGE
+  STORE_CREDIT
+  /// Return value is taken off what the customer still owes on the bill
+  ADJUST_DUE
+}
+
+enum CreditNoteStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+/// Where returned units go once the note is approved
+enum ReturnStockTo {
+  RESTOCK
+  DAMAGED
+}
+
+model CreditNote {
+  id            String           @id @default(uuid())
+  noteNumber    String
+  companyId     String
+  company       Company          @relation(fields: [companyId], references: [id])
+  branchId      String
+  branch        Branch           @relation(fields: [branchId], references: [id])
+  shopId        String
+  shop          Shop             @relation(fields: [shopId], references: [id])
+  salesBillId   String
+  salesBill     SalesBill        @relation(fields: [salesBillId], references: [id])
+  customerName  String?
+  customerPhone String?
+  settlement    ReturnSettlement
+  /// CASH, CARD or UPI; only for refunds
+  refundMode    String?
+  /// DEFECTIVE, DAMAGED_IN_TRANSIT, WRONG_ITEM, NOT_AS_DESCRIBED, CHANGED_MIND, OTHER
+  reason        String
+  reasonNote    String?
+  taxableAmount Float            @default(0)
+  taxAmount     Float            @default(0)
+  totalAmount   Float            @default(0)
+  status        CreditNoteStatus @default(PENDING_APPROVAL)
+  needsApproval Boolean          @default(false)
+  stockTo       ReturnStockTo?
+  decisionNote  String?
+  decidedById   String?
+  decidedBy     User?            @relation("CreditNoteDecidedBy", fields: [decidedById], references: [id])
+  decidedAt     DateTime?
+  createdById   String
+  createdBy     User             @relation("CreditNoteCreatedBy", fields: [createdById], references: [id])
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  items CreditNoteItem[]
+
+  @@unique([shopId, noteNumber])
+  @@index([branchId])
+  @@index([shopId])
+  @@index([status])
+  @@index([salesBillId])
+  @@index([createdAt])
+}
+
+model CreditNoteItem {
+  id              String         @id @default(uuid())
+  creditNoteId    String
+  creditNote      CreditNote     @relation(fields: [creditNoteId], references: [id], onDelete: Cascade)
+  salesBillItemId String
+  salesBillItem   SalesBillItem  @relation(fields: [salesBillItemId], references: [id])
+  productId       String
+  product         Product        @relation(fields: [productId], references: [id])
+  variantId       String
+  variant         ProductVariant @relation(fields: [variantId], references: [id])
+  quantity        Int
+  unitPrice       Float
+  taxRate         Float          @default(0)
+  taxableAmount   Float          @default(0)
+  taxAmount       Float          @default(0)
+  totalAmount     Float          @default(0)
+  productName     String?
+  variantSku      String?
+  variantName     String?
+  finish          String?
+
+  @@index([creditNoteId])
+  @@index([salesBillItemId])
+  @@index([variantId])
+}
+
+model ShopCustomer {
+  id           String   @id @default(uuid())
+  shopId       String
+  companyId    String
+  branchId     String
+  name         String
+  mobile       String
+  customerType String   @default("Retail")
+  businessName String?
+  gstin        String?
+  address      String?
+  creditLimit  Float    @default(0)
+  creditDays   Int      @default(15)
+  openingDue   Float    @default(0)
+  totalBought  Float    @default(0)
+  balanceDue   Float    @default(0)
+  notes        String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @default(now()) @updatedAt
+
+  company        Company                 @relation(fields: [companyId], references: [id])
+  branch         Branch                  @relation(fields: [branchId], references: [id])
+  shop           Shop                    @relation(fields: [shopId], references: [id])
+  creditPayments CustomerCreditPayment[]
+
+  @@unique([shopId, mobile])
+  @@index([shopId])
+  @@index([mobile])
+  @@index([customerType])
+}
+
+model CustomerCreditPayment {
+  id            String   @id @default(uuid())
+  receiptNumber String
+  shopId        String
+  companyId     String
+  branchId      String
+  customerId    String
+  amount        Float
+  mode          String // CASH, UPI, CARD, NETBANKING, CHEQUE
+  paidAt        DateTime @default(now())
+  note          String?
+  receivedById  String?
+  createdAt     DateTime @default(now())
+
+  customer ShopCustomer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  shop     Shop         @relation(fields: [shopId], references: [id])
+
+  @@index([shopId])
+  @@index([customerId])
+  @@index([paidAt])
+  @@index([receiptNumber])
+}
+
+model PurchaseReturn {
+  id             String   @id @default(uuid())
+  returnNumber   String
+  shopId         String
+  companyId      String
+  branchId       String
+  purchaseBillId String?
+  supplierName   String
+  supplierPhone  String?
+  supplierGstin  String?
+  returnDate     DateTime @default(now())
+  status         String   @default("DRAFT")
+  sentVia        String?
+  takeStockFrom  String   @default("DAMAGED_STOCK")
+  noteToSupplier String?
+  returnValue    Float    @default(0)
+  taxAmount      Float    @default(0)
+  totalAmount    Float    @default(0)
+  totalQuantity  Int      @default(0)
+  payableBefore  Float    @default(0)
+  payableAfter   Float    @default(0)
+  settleAs       String   @default("DEDUCT_FROM_PAYABLE")
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  shop         Shop                 @relation(fields: [shopId], references: [id])
+  purchaseBill PurchaseBill?        @relation(fields: [purchaseBillId], references: [id])
+  items        PurchaseReturnItem[]
+
+  @@unique([shopId, returnNumber])
+  @@index([shopId])
+  @@index([purchaseBillId])
+  @@index([returnDate])
+}
+
+model PurchaseReturnItem {
+  id                 String         @id @default(uuid())
+  returnId           String
+  purchaseReturn     PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  purchaseBillItemId String?
+  productId          String?
+  variantId          String?
+  productName        String
+  variantName        String?
+  hsn                String?
+  boughtQty          Int            @default(0)
+  inStockQty         Int            @default(0)
+  returnQty          Int            @default(0)
+  unitCost           Float          @default(0)
+  taxRate            Float          @default(5)
+  totalCost          Float          @default(0)
+  reason             String?
+
+  @@index([returnId])
+}
+
+model Supplier {
+  id             String   @id @default(uuid())
+  name           String
+  contactPerson  String?
+  phone          String?
+  email          String?
+  gstin          String?
+  city           String?
+  state          String?
+  address        String?
+  paymentTerms   String   @default("Net 30")
+  openingBalance Float    @default(0)
+  payable        Float    @default(0)
+  isOverdue      Boolean  @default(false)
+  nextDue        String?
+  companyId      String
+  branchId       String
+  shopId         String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  payments SupplierPayment[]
+
+  @@unique([branchId, name])
+  @@index([branchId])
+  @@index([shopId])
+  @@index([name])
+}
+
+model SupplierPayment {
+  id            String   @id @default(uuid())
+  receiptNumber String
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  supplierName  String
+  billId        String?
+  billNumber    String?
+  amount        Float
+  paymentMode   String   @default("NEFT / RTGS")
+  paidFrom      String?
+  paymentDate   DateTime @default(now())
+  utrChequeNo   String?
+  tdsDeducted   Float    @default(0)
+  notes         String?
+  companyId     String
+  branchId      String
+  shopId        String?
+  createdById   String?
+  createdAt     DateTime @default(now())
+
+  @@unique([branchId, receiptNumber])
+  @@index([supplierId])
+  @@index([branchId])
+  @@index([shopId])
+  @@index([paymentDate])
+}
+
+model BarcodePrintJob {
+  id            String   @id @default(uuid())
+  jobId         String   @unique
+  shopId        String?
+  branchId      String
+  companyId     String
+  sourceType    String   @default("PURCHASE_BILL")
+  sourceRef     String?
+  labelSize     String   @default("50x30mm")
+  printer       String?
+  showShopName  Boolean  @default(true)
+  showItemName  Boolean  @default(true)
+  showMrp       Boolean  @default(true)
+  showSalePrice Boolean  @default(true)
+  showCostCode  Boolean  @default(false)
+  totalLabels   Int      @default(0)
+  itemsSummary  Json?
+  createdById   String?
+  createdAt     DateTime @default(now())
+
+  @@index([branchId])
+  @@index([shopId])
+  @@index([createdAt])
+}
+
+model PhysicalStockAudit {
+  id                 String   @id @default(uuid())
+  auditNumber        String
+  shopId             String?
+  branchId           String
+  companyId          String
+  conductedById      String
+  status             String   @default("COMPLETED")
+  totalItemsCounted  Int      @default(0)
+  discrepanciesCount Int      @default(0)
+  notes              String?
+  auditItems         Json     @default("[]")
+  createdAt          DateTime @default(now())
+
+  @@index([branchId, createdAt])
+}
+
+/// Messages to a store customer: order updates, payments, returns, offers
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// ORDER, PAYMENT, RETURN, OFFER, ACCOUNT
+  type      String
+  title     String
+  body      String
+  /// Store page to open, e.g. /account/orders/<id>
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// "Contact us" messages from the store's help page
+model SupportRequest {
+  id          String   @id @default(uuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  name        String
+  email       String
+  phone       String?
+  topic       String
+  orderNumber String?
+  message     String
+  /// OPEN, CLOSED
+  status      String   @default("OPEN")
+  createdAt   DateTime @default(now())
+
+  @@index([status, createdAt])
+}
+
+/// Store-wide settings (P4-08b): one row, id "store"; the super admin changes them. No row = these defaults
+model StoreSettings {
+  id                  String   @id @default("store")
+  /// Standard delivery fee below the free-delivery amount
+  deliveryFee         Float    @default(49)
+  freeDeliveryAbove   Float    @default(999)
+  expressFee          Float    @default(99)
+  /// Days shown as "usually delivered by"
+  deliveryDaysStd     Int      @default(4)
+  deliveryDaysExpress Int      @default(1)
+  /// "Only a few left" badge at this stock or below
+  limitedBadgeAt      Int      @default(3)
+  /// A product is "New" for this many days (badge and the New filter)
+  newProductDays      Int      @default(30)
+  updatedAt           DateTime @updatedAt
+}
+
+// -------------------------------------------------------------
+// QUOTATIONS: a priced offer to a customer; converts into a sales bill
+// DRAFT -> SENT -> ACCEPTED -> CONVERTED   (or REJECTED / EXPIRED)
+// -------------------------------------------------------------
+
+model Quotation {
+  id              String   @id @default(uuid())
+  quotationNumber String
+  companyId       String
+  branchId        String
+  shopId          String
+  shop            Shop     @relation(fields: [shopId], references: [id])
+  customerName    String
+  customerPhone   String
+  customerEmail   String?
+  customerAddress String?
+  customerGstin   String?
+  /// RETAIL or WHOLESALE
+  saleType        String   @default("RETAIL")
+  quoteDate       DateTime @default(now())
+  validUntil      DateTime
+  /// DRAFT, SENT, ACCEPTED, REJECTED, CONVERTED
+  status          String   @default("DRAFT")
+  subtotal        Float    @default(0)
+  discount        Float    @default(0)
+  taxAmount       Float    @default(0)
+  /// Delivery / installation charges added to the quote
+  extraCharges    Float    @default(0)
+  totalAmount     Float    @default(0)
+  terms           String?
+  notes           String?
+  createdById     String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  items     QuotationItem[]
+  salesBill SalesBill?
+
+  @@unique([shopId, quotationNumber])
+  @@index([shopId, status])
+  @@index([companyId])
+  @@index([quoteDate])
+}
+
+model QuotationItem {
+  id          String          @id @default(uuid())
+  quotationId String
+  quotation   Quotation       @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  /// null for a custom line (a made-to-measure piece described in text)
+  productId   String?
+  product     Product?        @relation(fields: [productId], references: [id])
+  variantId   String?
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+  description String
+  hsnCode     String?
+  quantity    Int
+  unitPrice   Float
+  discount    Float           @default(0)
+  taxRate     Float           @default(18)
+  totalPrice  Float
+
+  @@index([quotationId])
+}
+
+
+// -------------------------------------------------------------
+// BUSINESS LINES, MANUFACTURING (work orders, BOM) AND DELIVERY
+// -------------------------------------------------------------
+
+enum BusinessLine {
+  FURNITURE
+  ELECTRONICS
+  CROCKERY
+}
+
+enum Sourcing {
+  TRADED
+  MANUFACTURED
+  MADE_TO_ORDER
+}
+
+/// Bill of materials: raw material needed to make one unit of a finished product
+model BomLine {
+  id                String         @id @default(uuid())
+  productId         String
+  product           Product        @relation("BomProduct", fields: [productId], references: [id], onDelete: Cascade)
+  materialVariantId String
+  materialVariant   ProductVariant @relation("BomMaterial", fields: [materialVariantId], references: [id])
+  /// Per finished unit, in the material's own unit (sheets, sq ft, kg, pcs...)
+  quantity          Float
+  wastagePct        Float          @default(0)
+  notes             String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@unique([productId, materialVariantId])
+  @@index([materialVariantId])
+}
+
+enum WorkOrderType {
+  MADE_TO_STOCK
+  MADE_TO_ORDER
+}
+
+enum WorkOrderStatus {
+  PLANNED
+  MATERIAL_ISSUED
+  IN_PROGRESS
+  QUALITY_CHECK
+  COMPLETED
+  DELIVERED
+  CANCELLED
+}
+
+/// A production job: raw material -> process stages -> QC -> stock (made to stock) or the customer (made to order)
+model WorkOrder {
+  id            String          @id @default(uuid())
+  woNumber      String          @unique
+  companyId     String
+  company       Company         @relation(fields: [companyId], references: [id])
+  branchId      String
+  branch        Branch          @relation(fields: [branchId], references: [id])
+  type          WorkOrderType
+  status        WorkOrderStatus @default(PLANNED)
+  priority      String          @default("NORMAL")
+  /// What is made: a catalogue product/variant, or a custom piece (title only)
+  productId     String?
+  product       Product?        @relation(fields: [productId], references: [id])
+  variantId     String?
+  variant       ProductVariant? @relation("WorkOrderOutput", fields: [variantId], references: [id])
+  title         String
+  quantity      Int
+
+  // Made to order: the customer and what was sold
+  customerName    String?
+  customerPhone   String?
+  customerAddress String?
+  orderId         String?
+  order           Order?     @relation(fields: [orderId], references: [id])
+  salesBillId     String?
+  salesBill       SalesBill? @relation(fields: [salesBillId], references: [id])
+  quotationId     String?
+
+  // Custom design
+  category      String?
+  productType   String?
+  lengthCm      Float?
+  widthCm       Float?
+  heightCm      Float?
+  /// Customer's size in their words, e.g. "King 6 x 6.5 ft"
+  sizeNote      String?
+  material      String?
+  finish        String?
+  colour        String?
+  /// [{name, quantity, price}] e.g. hydraulic storage, headboard cushion
+  accessories   Json            @default("[]")
+  designImages  String[]        @default([])
+  specNotes     String?
+
+  // Planning and process
+  startDate     DateTime?
+  dueDate       DateTime?
+  assignedToId  String?
+  assignedTo    User?           @relation("WorkOrderAssignee", fields: [assignedToId], references: [id])
+  /// [{key, label, done, at, by}] in order: cutting, carpentry, ...
+  stages        Json            @default("[]")
+  /// Rack where the finished pieces are kept
+  rackNo        String?
+
+  // Cost
+  materialCost  Float           @default(0)
+  labourCost    Float           @default(0)
+  overheadCost  Float           @default(0)
+  /// Agreed price with the customer (made to order)
+  quotedPrice   Float?
+  advancePaid   Float           @default(0)
+
+  qcPassed      Boolean?
+  qcNotes       String?
+  completedAt   DateTime?
+  deliveredAt   DateTime?
+  cancelReason  String?
+  notes         String?
+  createdById   String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  materials     WorkOrderMaterial[]
+  deliveries    Delivery[]
+
+  @@index([companyId])
+  @@index([branchId, status])
+  @@index([createdAt])
+}
+
+model WorkOrderMaterial {
+  id          String         @id @default(uuid())
+  workOrderId String
+  workOrder   WorkOrder      @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  plannedQty  Int
+  issuedQty   Int            @default(0)
+  returnedQty Int            @default(0)
+  /// Purchase cost per unit when issued
+  unitCost    Float          @default(0)
+
+  @@unique([workOrderId, variantId])
+}
+
+enum DeliveryStatus {
+  SCHEDULED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+/// Delivery (and installation) of sold or made-to-order pieces to the customer
+model Delivery {
+  id             String         @id @default(uuid())
+  deliveryNumber String         @unique
+  companyId      String
+  company        Company        @relation(fields: [companyId], references: [id])
+  branchId       String
+  branch         Branch         @relation(fields: [branchId], references: [id])
+  orderId        String?
+  order          Order?         @relation(fields: [orderId], references: [id])
+  salesBillId    String?
+  salesBill      SalesBill?     @relation(fields: [salesBillId], references: [id])
+  workOrderId    String?
+  workOrder      WorkOrder?     @relation(fields: [workOrderId], references: [id])
+  customerName   String
+  customerPhone  String
+  address        String
+  city           String?
+  postalCode     String?
+  /// [{name, quantity}]
+  items          Json           @default("[]")
+  scheduledDate  DateTime
+  slot           String?
+  installation   Boolean        @default(false)
+  assignedToId   String?
+  assignedTo     User?          @relation("DeliveryAssignee", fields: [assignedToId], references: [id])
+  status         DeliveryStatus @default(SCHEDULED)
+  notes          String?
+  /// Who received it / why it failed
+  outcomeNote    String?
+  deliveredAt    DateTime?
+  createdById    String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([companyId])
+  @@index([branchId, status])
+  @@index([scheduledDate])
+}

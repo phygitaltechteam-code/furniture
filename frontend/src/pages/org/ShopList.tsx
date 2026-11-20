@@ -1,0 +1,294 @@
+import {formatDate} from '@/components/Company';
+import {Column, ConfirmDialog, GenericTable} from '@/components/Forms';
+import {ShopEditor} from '@/components/Org/Editors';
+import ListToolbar, {FilterSelect} from '@/components/Org/ListToolbar';
+import {PageHeader, StatusBadge} from '@/components/ui';
+import {useAuthContext} from '@/context/AuthContext';
+import useInlineEditor from '@/hooks/useInlineEditor';
+import useListState from '@/hooks/useListState';
+import {useSwitchShop} from '@/lib/ownerShop';
+import {useCompanies} from '@/lib/react-query/queriesAndMutations/company';
+import {
+  useBranchOptions,
+  useSetShopStatus,
+  useShops,
+} from '@/lib/react-query/queriesAndMutations/org';
+import useCurrentUser from '@/hooks/useCurrentUser';
+import {singleShop} from '@/lib/roles';
+import {Panel, Shop} from '@/types/org';
+import {getErrorMessage} from '@/utils/axios';
+import {Link, useNavigate, useSearch} from '@tanstack/react-router';
+import {
+  CircleCheck,
+  CirclePause,
+  DoorOpen,
+  Pencil,
+  Plus,
+  Store,
+} from 'lucide-react';
+import {useState} from 'react';
+
+/**
+ * Shops master on one page: the add / edit form (with the shop login) opens
+ * above the list. Branch admin: own branch. Company admin: every branch, and
+ * can open a shop to run it. Super admin: read-only overview.
+ */
+const ShopList = ({panel}: {panel: Panel}) => {
+  const editable = panel !== 'super-admin';
+  const companyWide = panel === 'company-admin';
+  // Branch admins land here after sign-in with the Add Shop form open
+  const {add} = useSearch({strict: false}) as {add?: string};
+  const editor = useInlineEditor(editable && !!add);
+  const list = useListState();
+  const {data, isPending, isError, error, refetch, isFetching} = useShops(
+    panel,
+    list.params,
+  );
+  const branches = useBranchOptions(companyWide);
+  // A company with one branch does not need to see or filter by it
+  const showBranch =
+    panel !== 'branch-admin' &&
+    (!companyWide || (branches.data?.length ?? 0) > 1);
+  // Only the super admin filters by company
+  const companies = useCompanies({page: 1, limit: 100}, !editable);
+  const setStatus = useSetShopStatus(panel);
+  const [toggle, setToggle] = useState<Shop | null>(null);
+  const {user} = useAuthContext();
+  const switchShop = useSwitchShop();
+  const navigate = useNavigate();
+  const {data: me} = useCurrentUser();
+  // A single-shop business adds more shops only after switching to branch mode
+  const shopLimitReached =
+    companyWide && singleShop(me) && (data?.summary?.total ?? 0) > 0;
+
+  const openShop = (s: Shop) => {
+    if (!user?.id) return;
+    switchShop({userId: user.id, id: s.id, name: s.name});
+    navigate({to: '/shop-admin/dashboard'});
+  };
+
+  const columns: Column<Shop>[] = [
+    {
+      header: 'Branch',
+      key: 'name',
+      sortable: true,
+      render: (s) => (
+        <>
+          <p className="text-body-md font-medium text-espresso">{s.name}</p>
+          <p className="text-technical-data uppercase text-outline">{s.code}</p>
+        </>
+      ),
+    },
+    ...(panel === 'super-admin'
+      ? [
+          {
+            header: 'Company',
+            render: (s: Shop) => s.company.name,
+          } as Column<Shop>,
+        ]
+      : []),
+    ...(showBranch
+      ? [
+          {
+            header: 'Branch',
+            render: (s: Shop) => s.branch.name,
+          } as Column<Shop>,
+        ]
+      : []),
+    {
+      header: 'Login',
+      render: (s) =>
+        s.shopAdmin ? (
+          <>
+            <p className="text-espresso">{s.shopAdmin.fullname}</p>
+            <p className="text-technical-data text-outline">
+              +91 {s.shopAdmin.phoneNumber}
+            </p>
+          </>
+        ) : (
+          <span className="text-outline">No login</span>
+        ),
+    },
+    {header: 'Employees', key: 'employeeCount', align: 'right'},
+    {
+      header: 'Status',
+      key: 'status',
+      render: (s) => <StatusBadge status={s.status} />,
+    },
+    {
+      header: 'Added',
+      key: 'createdAt',
+      sortable: true,
+      hideBelow: 'xl',
+      render: (s) => (
+        <span className="text-technical-data text-outline">
+          {formatDate(s.createdAt)}
+        </span>
+      ),
+    },
+  ];
+
+  const addButton = editable && !shopLimitReached && (
+    <button type="button" onClick={editor.openNew} className="btn-primary">
+      <Plus size={14} /> Add Shop
+    </button>
+  );
+
+  return (
+    <>
+      <PageHeader
+        compact
+        breadcrumbs={[{label: 'Branches'}]}
+        title="Branches"
+        actions={!editor.editing && addButton}
+      />
+
+      {shopLimitReached && (
+        <p className="mb-4 text-body-sm text-on-surface-variant">
+          Single-shop business.{' '}
+          <Link to="/company-admin/profile" className="btn-text">
+            Switch to branch mode
+          </Link>{' '}
+          to add more branches.
+        </p>
+      )}
+
+      {editor.editing && (
+        <ShopEditor
+          key={editor.editing}
+          panel={panel}
+          id={editor.editId}
+          onDone={editor.close}
+        />
+      )}
+
+      <GenericTable
+        caption="Branches"
+        columns={columns}
+        data={data?.items}
+        loading={isPending}
+        fetching={isFetching}
+        error={isError ? error : undefined}
+        errorTitle="Branches could not be loaded"
+        errorMessage={getErrorMessage(error, 'Something went wrong.')}
+        onRetry={() => refetch()}
+        emptyIcon={<Store size={22} strokeWidth={1.5} />}
+        emptyTitle={list.hasFilters ? 'No matching branches' : 'No branches yet'}
+        emptyAction={
+          list.hasFilters ? (
+            <button type="button" onClick={list.clear} className="btn-ghost">
+              Clear filters
+            </button>
+          ) : (
+            !editor.editing && addButton
+          )
+        }
+        onRowClick={editable ? (s) => editor.openEdit(s.id) : undefined}
+        rowActions={
+          editable
+            ? (s) => [
+                ...(companyWide && s.status === 'ACTIVE'
+                  ? [
+                      {
+                        label: 'Open branch',
+                        icon: <DoorOpen size={16} />,
+                        onClick: openShop,
+                      },
+                    ]
+                  : []),
+                {
+                  label: 'Edit',
+                  icon: <Pencil size={16} />,
+                  onClick: () => editor.openEdit(s.id),
+                },
+                s.status === 'ACTIVE'
+                  ? {
+                      label: 'Deactivate',
+                      icon: <CirclePause size={16} />,
+                      onClick: setToggle,
+                      tone: 'danger',
+                    }
+                  : {
+                      label: 'Activate',
+                      icon: <CircleCheck size={16} />,
+                      onClick: setToggle,
+                    },
+              ]
+            : undefined
+        }
+        pagination={data?.pagination}
+        onPageChange={list.setPage}
+        sort={list.sort}
+        onSortChange={list.setSort}
+        toolbar={
+          <ListToolbar
+            tabs={[
+              {label: 'All', value: undefined, count: data?.summary?.total},
+              {label: 'Active', value: 'ACTIVE', count: data?.summary?.active},
+              {
+                label: 'Inactive',
+                value: 'INACTIVE',
+                count: data?.summary?.inactive,
+              },
+            ]}
+            tab={list.filters.status}
+            onTab={(status) => list.setFilter({status})}
+            searchText={list.searchText}
+            onSearch={list.setSearchText}
+            placeholder="Search name, code or phone"
+          >
+            {companyWide && showBranch && (
+              <FilterSelect
+                label="Branches"
+                value={list.filters.branchId}
+                onChange={(branchId) => list.setFilter({branchId})}
+                options={branches.data ?? []}
+              />
+            )}
+            {!editable && (
+              <FilterSelect
+                label="Companies"
+                value={list.filters.companyId}
+                onChange={(companyId) => list.setFilter({companyId})}
+                options={(companies.data?.items ?? []).map((c) => ({
+                  value: c.id,
+                  label: c.name,
+                }))}
+              />
+            )}
+          </ListToolbar>
+        }
+      />
+
+      <ConfirmDialog
+        open={!!toggle}
+        title={
+          toggle?.status === 'ACTIVE' ? 'Deactivate branch?' : 'Activate branch?'
+        }
+        message={
+          toggle?.status === 'ACTIVE'
+            ? `${toggle?.name}'s login and employees will be signed out and cannot sign in.`
+            : `${toggle?.name}'s login and employees can sign in again.`
+        }
+        confirmLabel={toggle?.status === 'ACTIVE' ? 'Deactivate' : 'Activate'}
+        tone={toggle?.status === 'ACTIVE' ? 'danger' : 'default'}
+        requireReason={toggle?.status === 'ACTIVE'}
+        isLoading={setStatus.isPending}
+        onCancel={() => setToggle(null)}
+        onConfirm={async (reason) => {
+          if (!toggle) return;
+          await setStatus
+            .mutateAsync({
+              id: toggle.id,
+              status: toggle.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE',
+              reason,
+            })
+            .catch(() => undefined);
+          setToggle(null);
+        }}
+      />
+    </>
+  );
+};
+
+export default ShopList;

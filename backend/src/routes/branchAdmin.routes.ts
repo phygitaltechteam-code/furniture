@@ -1,0 +1,159 @@
+import {Router} from 'express';
+import {
+    orgController,
+    ecommerceController,
+    masterController,
+    billController,
+    creditNoteController,
+    customerDueController,
+    branchPurchaseController,
+    supplierController,
+    barcodeLabelController,
+    stockController,
+    stockAdjustmentController,
+    branchPricingController,
+    stockTransferController,
+    dayCloseController,
+    branchApprovalController,
+    branchExpenseController,
+    branchReportsController,
+    branchStaffController,
+    branchProfileSetupController,
+    analyticsController,
+} from '@controllers/index';
+import {checkBranchAdmin, verifyJWT} from '@middlewares/index';
+import mountCatalog from './catalog.routes';
+import {mountPromotions} from './promotion.routes';
+
+const c = orgController;
+const e = ecommerceController;
+const router = Router();
+
+// Everything here is limited to the signed-in admin's own branch
+router.use(verifyJWT, checkBranchAdmin);
+
+router.get('/dashboard', c.scopedDashboard);
+router.get('/analytics', analyticsController.summary);
+router.get('/overview', c.branchOverview);
+router.get('/profile', c.branchProfile);
+
+// The branch outlet (one per branch): picker and stats
+router.get('/shops/options', c.shopOptions);
+router.get('/shops/stats', c.shopStats);
+
+// Employees of this branch
+router.route('/employees').get(c.listEmployees).post(c.createEmployee);
+router.route('/employees/:id').get(c.getEmployee).patch(c.updateEmployee);
+
+router.patch('/users/:id/status', c.setUserStatus);
+router.post('/users/:id/revoke-sessions', c.revokeSessions);
+
+// Catalog: the company's products; edits limited to products of this branch
+mountCatalog(router, {manageProducts: true});
+// Sub-categories for the offer form (read only; edited in the shop panel)
+router.get('/subcategories', masterController.listSubcategories);
+
+// Products & Price List (Branch Pricing)
+// View only (D-13): prices are set by each shop
+router.get('/products-pricing', branchPricingController.list);
+
+// Branch Inventory
+router.get('/inventory/dashboard', e.inventoryDashboard);
+router.get('/inventory', e.listInventory);
+router.post('/inventory/adjust', e.adjustStock);
+router.post('/inventory/batch-adjust', e.batchAdjustStock);
+router.patch('/inventory/threshold', e.updateThreshold);
+router.get('/inventory/movements', e.listMovements);
+
+// Stock Transfers: the branch's own requests (head office approves and picks the source branch)
+const tr = stockTransferController.branch;
+router.get('/transfers', tr.list);
+router.get('/transfers/summary', tr.summary);
+router.get('/transfers/:id', tr.get);
+
+// Sales bills of every shop in the branch (view only; bills are made at the shop POS)
+router.get('/sales-bills', billController.branchSales.list);
+router.get('/sales-bills/summary', billController.branchSales.summary);
+router.get('/sales-bills/export', billController.branchSales.export);
+router.get('/sales-bills/:id', billController.branchSales.get);
+
+// Customers & Dues (credit sales of the branch shops, credit limits, over-limit approvals)
+router.get('/customer-dues', customerDueController.list);
+router.get('/customer-dues/summary', customerDueController.summary);
+router.get('/customer-dues/export', customerDueController.export);
+router.post('/customer-dues/reminders', customerDueController.sendReminders);
+router.get('/customer-dues/:id', customerDueController.get);
+router.patch('/customer-dues/:id/limit', customerDueController.updateLimit);
+
+// Purchase Bills of the branch and its shops
+router.get('/purchase-bills', branchPurchaseController.list);
+router.get('/purchase-bills/summary', branchPurchaseController.summary);
+router.get('/purchase-bills/:id', branchPurchaseController.get);
+
+// Suppliers & Payments
+router.get('/suppliers', supplierController.listSuppliers);
+router.post('/suppliers', supplierController.createSupplier);
+router.get('/suppliers/next-receipt', supplierController.getNextReceipt);
+router.get('/suppliers/:id/ledger', supplierController.getSupplierLedger);
+router.post('/suppliers/payment', supplierController.recordPayment);
+
+
+// ---- Live Stock Summary & Audit ----
+router.get('/stock/summary', stockController.getStockSummary);
+router.post('/stock/adjust', stockController.adjustStock);
+router.post('/stock/physical-count', stockController.recordPhysicalStockCount);
+
+// ---- Stock Adjustments (Dedicated Page) ----
+router.get('/stock-adjustments/next-number', stockAdjustmentController.getNextAdjustmentNumber);
+router.get('/stock-adjustments/variants', stockAdjustmentController.getAdjustmentVariants);
+router.get('/stock-adjustments', stockAdjustmentController.getAdjustmentHistory);
+router.post('/stock-adjustments', stockAdjustmentController.createAdjustment);
+
+// ---- Barcode Labels ----
+router.get('/barcode-labels/purchase-bills', barcodeLabelController.getPurchaseBills);
+router.get('/barcode-labels/bills/:billId/items', barcodeLabelController.getBillItems);
+router.get('/barcode-labels/products', barcodeLabelController.searchProducts);
+router.get('/barcode-labels/reprint-batches', barcodeLabelController.getReprintBatches);
+router.post('/barcode-labels/print', barcodeLabelController.recordPrintJob);
+
+// Accounts: Cash & Day Close
+router.get('/day-close', dayCloseController.get);
+router.post('/day-close/resolve-difference', dayCloseController.resolveDifference);
+router.post('/day-close/bank-deposit', dayCloseController.recordDeposit);
+
+// Accounts: Expenses
+router.get('/expenses', branchExpenseController.list);
+router.post('/expenses', branchExpenseController.add);
+
+// Overview: Approvals
+router.get('/approvals', branchApprovalController.list);
+
+// Reports
+router.get('/reports/pnl', branchReportsController.getPnl);
+
+// Setup: Staff Overview
+router.get('/staff-overview', branchStaffController.list);
+
+// Setup: Branch Profile
+router.get('/branch-profile', branchProfileSetupController.get);
+router.patch('/branch-profile', branchProfileSetupController.update);
+
+// Sales returns of every shop; the branch admin approves cash / large refunds
+router.get('/credit-notes', creditNoteController.branch.list);
+router.get('/credit-notes/summary', creditNoteController.branch.summary);
+router.get('/credit-notes/:id', creditNoteController.branch.get);
+router.post('/credit-notes/:id/decision', creditNoteController.branch.decide);
+
+// Branch Orders
+router.get('/orders/dashboard', e.orderDashboard);
+router.route('/orders').get(e.listOrders);
+router.route('/orders/:id').get(e.getOrder);
+router.get('/orders/:id/invoice', e.getOrderInvoice);
+
+// Branch Returns
+router.get('/returns', e.listReturns);
+
+// Promotions & Offers
+mountPromotions(router);
+
+export default router;

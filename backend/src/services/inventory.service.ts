@@ -1,0 +1,1273 @@
+import {randomUUID} from 'crypto';
+import {Prisma, MovementType, StockSourceType} from '@prisma/client';
+import httpStatus from 'http-status';
+import prisma from '../client';
+import ApiError from '@utils/ApiError';
+import accountService, {Scope} from './account.service';
+import shopGstService from './shopGst.service';
+import {rateFor} from '../utils/gst';
+
+export interface AdjustStockInput {
+    branchId?: string;
+    variantId: string;
+    type: 'INCREASE' | 'DECREASE' | 'CORRECTION';
+    quantity: number;
+    reason: string;
+    notes?: string;
+}
+
+export interface BatchAdjustItem {
+    variantId: string;
+    quantity: number;
+}
+
+export interface BatchAdjustInput {
+    branchId?: string;
+    type: 'INCREASE' | 'DECREASE';
+    reason: string;
+    reference?: string;
+    items: BatchAdjustItem[];
+}
+
+export interface UpdateThresholdInput {
+    branchId?: string;
+    variantId: string;
+    threshold: number;
+}
+
+export interface InventoryListParams {
+    branchId?: string;
+    search?: string;
+    status?: 'all' | 'in_stock' | 'low_stock' | 'out_of_stock';
+    categoryId?: string;
+    view?: 'product' | 'variant';
+    page?: number;
+    limit?: number;
+}
+
+export interface StockChange {
+    variantId: string;
+    productId: string;
+    /** Positive = stock in, negative = stock out */
+    delta: number;
+    type: MovementType;
+}
+
+export interface ApplyStockChangesInput {
+    branchId: string;
+    changes: StockChange[];
+    reason: string;
+    reference?: string | null;
+    sourceType?: StockSourceType;
+    sourceId?: string;
+    performedById?: string | null;
+    /** A stock count records what is on the shelf, even below what online orders have reserved */
+    allowBelowReserved?: boolean;
+}
+
+/** Most lines one manual save may change (physical count, batch adjust) */
+export const MAX_ADJUST_LINES = 500;
+/** About 8 queries per line: a full 500-line save needs more than Prisma's 5 s default on a hosted database */
+export const LONG_ADJUST_TX = {timeout: 60_000, maxWait: 10_000};
+
+/** CORRECTION sets the count: its quantity is what was counted, not a change */
+export type ManualAdjustType = 'INCREASE' | 'DECREASE' | 'MARK_DAMAGED' | 'WRITE_OFF' | 'CORRECTION';
+
+export interface ManualAdjustInput {
+    branchId: string;
+    shopId?: string | null;
+    companyId?: string | null;
+    reason: string;
+    reference?: string | null;
+    photoUrl?: string | null;
+    notes?: string | null;
+    approvalStatus?: string;
+    performedById: string;
+    /** Variants already checked to be the caller's; label is for messages, e.g. "Aspen Sofa (3 Seater)" */
+    lines: {
+        variantId: string;
+        productId: string;
+        label: string;
+        type: ManualAdjustType;
+        quantity: number;
+        /** CORRECTION only: the count the screen showed when counting started (see recordAdjustments) */
+        expected?: number;
+        /** This line's own reason, instead of the input's */
+        reason?: string;
+    }[];
+}
+
+class InventoryService {
+    /**
+     * Single entry point for automatic stock posting (bills, orders, returns).
+     * Must run inside the caller's transaction so the document and its stock
+     * effect commit or roll back together. Decrements are guarded atomically
+     * against available stock (physical - reserved), so concurrent sales
+     * cannot oversell.
+     */
+    public applyStockChanges = async (
+        tx: Prisma.TransactionClient,
+        input: ApplyStockChangesInput,
+    ) => {
+        const {branchId, reason, reference, sourceType, sourceId, performedById} = input;
+
+        // Merge per variant + movement type, drop no-ops, fixed lock order
+        const merged = new Map<string, StockChange>();
+        for (const c of input.changes) {
+            const key = `${c.variantId}:${c.type}`;
+            const prev = merged.get(key);
+            merged.set(key, prev ? {...prev, delta: prev.delta + c.delta} : {...c});
+        }
+        const changes = [...merged.values()]
+            .filter((c) => c.delta !== 0)
+            .sort((a, b) => a.variantId.localeCompare(b.variantId));
+
+        for (const c of changes) {
+            let newPhysical: number;
+
+            if (c.delta > 0) {
+                const inv = await tx.inventory.upsert({
+                    where: {branchId_variantId: {branchId, variantId: c.variantId}},
+                    create: {branchId, variantId: c.variantId, physicalQty: c.delta},
+                    update: {physicalQty: {increment: c.delta}},
+                });
+                newPhysical = inv.physicalQty;
+            } else {
+                const qty = -c.delta;
+                const rows = await tx.$queryRaw<Array<{physicalQty: number}>>`
+                    UPDATE "Inventory"
+                    SET "physicalQty" = "physicalQty" - ${qty}, "updatedAt" = NOW()
+                    WHERE "branchId" = ${branchId} AND "variantId" = ${c.variantId}
+                      AND "physicalQty" - CASE WHEN ${!input.allowBelowReserved} THEN "reservedQty" ELSE 0 END >= ${qty}
+                    RETURNING "physicalQty"`;
+
+                if (!rows.length) {
+                    const [inv, variant] = await Promise.all([
+                        tx.inventory.findUnique({
+                            where: {branchId_variantId: {branchId, variantId: c.variantId}},
+                        }),
+                        tx.productVariant.findUnique({
+                            where: {id: c.variantId},
+                            select: {variantName: true, finish: true, product: {select: {name: true}}},
+                        }),
+                    ]);
+                    const available = Math.max(
+                        0,
+                        (inv?.physicalQty ?? 0) - (inv?.reservedQty ?? 0),
+                    );
+                    const label = variant
+                        ? `"${variant.product.name}" (${variant.variantName} / ${variant.finish})`
+                        : 'selected item';
+                    throw new ApiError(
+                        httpStatus.BAD_REQUEST,
+                        `Insufficient stock for ${label}. Required: ${qty}, available: ${available}`,
+                    );
+                }
+                newPhysical = rows[0].physicalQty;
+            }
+
+            await tx.stockMovement.create({
+                data: {
+                    branchId,
+                    variantId: c.variantId,
+                    type: c.type,
+                    quantity: Math.abs(c.delta),
+                    prevPhysical: newPhysical - c.delta,
+                    newPhysical,
+                    reason,
+                    reference: reference ?? null,
+                    sourceType: sourceType ?? null,
+                    sourceId: sourceId ?? null,
+                    performedById: performedById ?? null,
+                },
+            });
+        }
+
+        await this.syncProductStock(tx, branchId, [...new Set(changes.map((c) => c.productId))]);
+        return changes;
+    };
+
+    /** Adjustment numbers run per branch: ADJ-0001, ADJ-0002... */
+    public nextAdjustmentNumber = (tx: Prisma.TransactionClient, branchId: string) =>
+        accountService.nextCode(tx, 'ADJ-', 4, async (prefix) =>
+            (
+                await tx.stockAdjustment.findMany({
+                    where: {branchId, adjustmentNumber: {startsWith: prefix}},
+                    select: {adjustmentNumber: true},
+                })
+            ).map((a) => a.adjustmentNumber ?? ''),
+        );
+
+    /**
+     * The one path for manual stock changes (Stock Adjustment, Stock page, physical count,
+     * Inventory adjust and batch). Each line gets an ADJ number, a stock movement through
+     * applyStockChanges and an adjustment record with the counts before and after.
+     * Runs in the caller's transaction; lines that change nothing are skipped.
+     */
+    public recordAdjustments = async (tx: Prisma.TransactionClient, input: ManualAdjustInput) => {
+        const {branchId, performedById} = input;
+        // One adjustment at a time per branch, so two saves can't take the same number
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'stock-adjustment:' + branchId}))`;
+        // Numbered once per save and counted up (the lock above holds the series): reading every
+        // ADJ number of the branch per line is too slow for a big count
+        let next = Number((await this.nextAdjustmentNumber(tx, branchId)).slice('ADJ-'.length));
+
+        const results = [];
+        for (const line of input.lines) {
+            let {type, quantity: qty} = line;
+            const reason = line.reason || input.reason;
+            if (type === 'CORRECTION') {
+                // Lock the row so a sale in between is not counted over
+                const [row] = await tx.$queryRaw<{physicalQty: number}[]>`
+                    SELECT "physicalQty" FROM "Inventory"
+                    WHERE "branchId" = ${branchId} AND "variantId" = ${line.variantId} FOR UPDATE`;
+                const physical = row?.physicalQty ?? 0;
+                // Counted against what the screen showed: apply only the difference, so sales made
+                // after the count was opened are not undone. Without it the count is set as is.
+                const diff = line.quantity - (line.expected ?? physical);
+                if (!diff) continue;
+                if (physical + diff < 0) {
+                    throw new ApiError(
+                        httpStatus.CONFLICT,
+                        `The stock of ${line.label} changed since the count was opened (now ${physical}). Reload and count it again.`,
+                    );
+                }
+                type = diff > 0 ? 'INCREASE' : 'DECREASE';
+                qty = Math.abs(diff);
+            }
+            // Damaged units sit outside the sellable count: marking damaged moves them out, writing off removes them
+            const delta = type === 'INCREASE' ? qty : type === 'WRITE_OFF' ? 0 : -qty;
+            const damagedDelta = type === 'MARK_DAMAGED' ? qty : type === 'WRITE_OFF' ? -qty : 0;
+            const movementType =
+                type === 'INCREASE'
+                    ? MovementType.ADJUSTMENT_INCREASE
+                    : type === 'MARK_DAMAGED'
+                      ? MovementType.DAMAGE_WRITE_OFF
+                      : MovementType.ADJUSTMENT_DECREASE;
+            const adjustmentNumber = `ADJ-${String(next++).padStart(4, '0')}`;
+            const id = randomUUID();
+
+            if (delta) {
+                await this.applyStockChanges(tx, {
+                    branchId,
+                    changes: [{variantId: line.variantId, productId: line.productId, delta, type: movementType}],
+                    reason,
+                    reference: adjustmentNumber,
+                    sourceType: StockSourceType.ADJUSTMENT,
+                    sourceId: id,
+                    performedById,
+                    allowBelowReserved: line.type === 'CORRECTION',
+                });
+            }
+            if (damagedDelta) {
+                const {count} = await tx.inventory.updateMany({
+                    where: {
+                        branchId,
+                        variantId: line.variantId,
+                        ...(damagedDelta < 0 ? {damagedQty: {gte: qty}} : {}),
+                    },
+                    data: {damagedQty: {increment: damagedDelta}},
+                });
+                if (!count) {
+                    const inv = await tx.inventory.findUnique({
+                        where: {branchId_variantId: {branchId, variantId: line.variantId}},
+                    });
+                    throw new ApiError(
+                        httpStatus.BAD_REQUEST,
+                        `Only ${inv?.damagedQty ?? 0} damaged unit(s) of ${line.label} can be written off`,
+                    );
+                }
+            }
+
+            // Read after the change: the row is locked by now, so before = after - change
+            const inv = await tx.inventory.findUniqueOrThrow({
+                where: {branchId_variantId: {branchId, variantId: line.variantId}},
+            });
+            const result = {
+                adjustmentNumber,
+                variantId: line.variantId,
+                type,
+                quantity: qty,
+                availableBefore: inv.physicalQty - delta,
+                availableAfter: inv.physicalQty,
+                damagedBefore: inv.damagedQty - damagedDelta,
+                damagedAfter: inv.damagedQty,
+                inventory: inv,
+            };
+            await tx.stockAdjustment.create({
+                data: {
+                    id,
+                    adjustmentNumber,
+                    reference: input.reference || null,
+                    photoUrl: input.photoUrl || null,
+                    branchId,
+                    shopId: input.shopId || null,
+                    companyId: input.companyId || null,
+                    variantId: line.variantId,
+                    type,
+                    quantity: qty,
+                    availableBefore: result.availableBefore,
+                    availableAfter: result.availableAfter,
+                    damagedBefore: result.damagedBefore,
+                    damagedAfter: result.damagedAfter,
+                    reason,
+                    approvalStatus: input.approvalStatus ?? 'AUTO',
+                    notes: input.notes || null,
+                    createdById: performedById,
+                },
+            });
+            results.push(result);
+        }
+        return results;
+    };
+
+    /** Recompute Product.stockQuantity from its active variants' inventory in the branch. */
+    private syncProductStock = async (
+        tx: Prisma.TransactionClient,
+        branchId: string,
+        productIds: string[],
+    ) => {
+        for (const productId of productIds) {
+            const totalStock = await tx.inventory.aggregate({
+                where: {branchId, variant: {productId, isActive: true}},
+                _sum: {physicalQty: true},
+            });
+            await tx.product.update({
+                where: {id: productId},
+                data: {stockQuantity: totalStock._sum.physicalQty ?? 0},
+            });
+        }
+    };
+
+    /**
+     * Resolves the target branchId for the given scope and input.
+     * If user is shop-admin, employee, or branch-admin, their branchId is used.
+     * If company-admin/super-admin, provided branchId or the variant's owning branch is used.
+     */
+    private async resolveBranchId(scope: Scope, branchId?: string, variantId?: string): Promise<string> {
+        if (scope.branchId) return scope.branchId;
+        if (branchId) {
+            // A company admin picks the branch; it must be one of their own
+            if (scope.companyId) {
+                const own = await prisma.branch.findFirst({
+                    where: {id: branchId, companyId: scope.companyId, deletedAt: null},
+                    select: {id: true},
+                });
+                if (!own) throw new ApiError(httpStatus.NOT_FOUND, 'Branch not found');
+            }
+            return branchId;
+        }
+
+        // Try to resolve from variant's product shop/branch
+        if (variantId) {
+            const variant = await prisma.productVariant.findUnique({
+                where: {id: variantId},
+                select: {
+                    product: {
+                        select: {
+                            shop: {select: {branchId: true}},
+                            companyId: true,
+                        },
+                    },
+                },
+            });
+            if (variant?.product?.shop?.branchId) {
+                return variant.product.shop.branchId;
+            }
+            if (variant?.product?.companyId) {
+                const firstBranch = await prisma.branch.findFirst({
+                    where: {companyId: variant.product.companyId, deletedAt: null},
+                    select: {id: true},
+                });
+                if (firstBranch) return firstBranch.id;
+            }
+        }
+
+        if (scope.companyId) {
+            const firstBranch = await prisma.branch.findFirst({
+                where: {companyId: scope.companyId, deletedAt: null},
+                select: {id: true},
+            });
+            if (firstBranch) return firstBranch.id;
+        }
+
+        throw new ApiError(httpStatus.BAD_REQUEST, 'Branch is required for inventory operations');
+    }
+
+    /**
+     * Variant ids are public on the storefront, so every stock write must check the variant is
+     * the caller's: a shop only its own products; a branch its shops' and shop-less catalog products
+     */
+    private assertOwnVariants(
+        scope: Scope,
+        variants: {
+            product: {companyId: string; shopId: string | null; shop: {branchId: string} | null};
+        }[],
+    ) {
+        if (scope.companyId && variants.some((v) => v.product.companyId !== scope.companyId)) {
+            throw new ApiError(httpStatus.FORBIDDEN, 'Variant does not belong to your company');
+        }
+        if (scope.shopId && variants.some((v) => v.product.shopId !== scope.shopId)) {
+            throw new ApiError(httpStatus.FORBIDDEN, 'Variant does not belong to your shop');
+        }
+        if (
+            !scope.shopId &&
+            scope.branchId &&
+            variants.some((v) => v.product.shop && v.product.shop.branchId !== scope.branchId)
+        ) {
+            throw new ApiError(httpStatus.FORBIDDEN, 'Variant does not belong to your branch');
+        }
+    }
+
+    /**
+     * Inventory Dashboard Metrics
+     */
+    public getDashboard = async (scope: Scope, params: {branchId?: string}) => {
+        const targetBranchId = scope.branchId || params.branchId;
+
+        const productWhere: Prisma.ProductWhereInput = {
+            deletedAt: null,
+            ...(scope.companyId ? {companyId: scope.companyId} : {}),
+            ...(scope.shopId ? {shopId: scope.shopId} : {}),
+        };
+
+        // Get total products and all active variants
+        const [totalProducts, products] = await Promise.all([
+            prisma.product.count({where: productWhere}),
+            prisma.product.findMany({
+                where: productWhere,
+                select: {
+                    id: true,
+                    name: true,
+                    sku: true,
+                    category: {select: {name: true}},
+                    images: {where: {isMain: true}, take: 1, select: {url: true}},
+                    variants: {
+                        where: {isActive: true},
+                        select: {
+                            id: true,
+                            variantSku: true,
+                            variantName: true,
+                            finish: true,
+
+                            inventories: {
+                                where: targetBranchId ? {branchId: targetBranchId} : {},
+                                select: {
+                                    physicalQty: true,
+                                    reservedQty: true,
+                                    threshold: true,
+                                    branchId: true,
+                                },
+                            },
+                        },
+                    },
+                },
+            }),
+        ]);
+
+        let totalVariants = 0;
+        let totalPhysicalStock = 0;
+        let totalAvailableStock = 0;
+        let inStockCount = 0;
+        let lowStockCount = 0;
+        let outOfStockCount = 0;
+
+        const alerts: Array<{
+            id: string;
+            variantId: string;
+            productId: string;
+            productName: string;
+            productSku: string;
+            variantSku: string;
+            variantName: string;
+            finish: string;
+            category: string;
+            image: string | null;
+            physicalStock: number;
+            reservedStock: number;
+            availableStock: number;
+            threshold: number;
+            status: 'OUT_OF_STOCK' | 'LOW_STOCK';
+        }> = [];
+
+        for (const prod of products) {
+            for (const v of prod.variants) {
+                totalVariants++;
+                // Aggregate across matching branch inventories or default to 0
+                const inv = v.inventories[0];
+                const physical = inv?.physicalQty ?? 0;
+                const reserved = inv?.reservedQty ?? 0;
+                const threshold = inv?.threshold ?? 5;
+                const available = Math.max(0, physical - reserved);
+
+                totalPhysicalStock += physical;
+                totalAvailableStock += available;
+
+                if (available <= 0) {
+                    outOfStockCount++;
+                    alerts.push({
+                        id: inv ? `${inv.branchId}_${v.id}` : `v_${v.id}`,
+                        variantId: v.id,
+                        productId: prod.id,
+                        productName: prod.name,
+                        productSku: prod.sku,
+                        variantSku: v.variantSku,
+                        variantName: v.variantName,
+                        finish: v.finish,
+
+                        category: prod.category.name,
+                        image: prod.images[0]?.url ?? null,
+                        physicalStock: physical,
+                        reservedStock: reserved,
+                        availableStock: available,
+                        threshold,
+                        status: 'OUT_OF_STOCK',
+                    });
+                } else if (available <= threshold) {
+                    lowStockCount++;
+                    alerts.push({
+                        id: inv ? `${inv.branchId}_${v.id}` : `v_${v.id}`,
+                        variantId: v.id,
+                        productId: prod.id,
+                        productName: prod.name,
+                        productSku: prod.sku,
+                        variantSku: v.variantSku,
+                        variantName: v.variantName,
+                        finish: v.finish,
+
+                        category: prod.category.name,
+                        image: prod.images[0]?.url ?? null,
+                        physicalStock: physical,
+                        reservedStock: reserved,
+                        availableStock: available,
+                        threshold,
+                        status: 'LOW_STOCK',
+                    });
+                } else {
+                    inStockCount++;
+                }
+            }
+        }
+
+        // Sort alerts: Out of stock first, then lowest available
+        alerts.sort((a, b) => a.availableStock - b.availableStock);
+
+        // Fetch recent movements (last 10)
+        const recentMovementsRaw = await prisma.stockMovement.findMany({
+            where: {
+                ...(targetBranchId ? {branchId: targetBranchId} : {}),
+                ...(scope.companyId ? {branch: {companyId: scope.companyId}} : {}),
+            },
+            take: 8,
+            orderBy: {createdAt: 'desc'},
+            include: {
+                branch: {select: {id: true, name: true, code: true}},
+                variant: {
+                    select: {
+                        id: true,
+                        variantSku: true,
+                        variantName: true,
+                        finish: true,
+                        product: {select: {id: true, name: true, sku: true}},
+                    },
+                },
+            },
+        });
+
+        // Enrich performedBy users
+        const userIds = [...new Set(recentMovementsRaw.map((m) => m.performedById).filter(Boolean))] as string[];
+        const users = userIds.length
+            ? await prisma.user.findMany({
+                  where: {id: {in: userIds}},
+                  select: {id: true, fullname: true, email: true},
+              })
+            : [];
+        const userMap = new Map(users.map((u) => [u.id, u]));
+
+        const recentMovements = recentMovementsRaw.map((m) => ({
+            id: m.id,
+            branch: m.branch,
+            product: m.variant.product,
+            variant: {
+                id: m.variant.id,
+                sku: m.variant.variantSku,
+                variantName: m.variant.variantName,
+                finish: m.variant.finish,
+            },
+            type: m.type,
+            quantity: m.quantity,
+            prevPhysical: m.prevPhysical,
+            newPhysical: m.newPhysical,
+            reason: m.reason,
+            reference: m.reference,
+            createdAt: m.createdAt,
+            performedBy: m.performedById ? userMap.get(m.performedById) ?? null : null,
+        }));
+
+        return {
+            summary: {
+                totalProducts,
+                totalVariants,
+                totalPhysicalStock,
+                totalAvailableStock,
+                inStockCount,
+                lowStockCount,
+                outOfStockCount,
+            },
+            alerts: alerts.slice(0, 10),
+            recentMovements,
+        };
+    };
+
+    /**
+     * List inventory with support for product-level grouping or flat variant list.
+     */
+    public list = async (scope: Scope, params: InventoryListParams) => {
+        const {
+            page = 1,
+            limit = 20,
+            search,
+            status = 'all',
+            categoryId,
+            view = 'product',
+            branchId,
+        } = params;
+
+        let targetBranchId = scope.branchId || branchId;
+        if (!targetBranchId && scope.shopId) {
+            const shop = await prisma.shop.findUnique({
+                where: {id: scope.shopId},
+                select: {branchId: true},
+            });
+            if (shop?.branchId) targetBranchId = shop.branchId;
+        }
+        const skip = (page - 1) * limit;
+
+        // Base product filter for tenancy/scope
+        const baseProductWhere: Prisma.ProductWhereInput = {
+            deletedAt: null,
+            ...(scope.companyId ? {companyId: scope.companyId} : {}),
+            ...(scope.shopId ? {shopId: scope.shopId} : {}),
+            ...(categoryId ? {categoryId} : {}),
+        };
+
+        const productWhere: Prisma.ProductWhereInput = {
+            ...baseProductWhere,
+            ...(search
+                ? {
+                      OR: [
+                          {name: {contains: search, mode: 'insensitive'}},
+                          {sku: {contains: search, mode: 'insensitive'}},
+                          {productType: {contains: search, mode: 'insensitive'}},
+                          {
+                              variants: {
+                                  some: {
+                                      OR: [
+                                          {variantSku: {contains: search, mode: 'insensitive'}},
+                                          {variantName: {contains: search, mode: 'insensitive'}},
+                                          {finish: {contains: search, mode: 'insensitive'}},
+                                      ],
+                                  },
+                              },
+                          },
+                      ],
+                  }
+                : {}),
+        };
+
+        if (view === 'product') {
+            const [products, total] = await Promise.all([
+                prisma.product.findMany({
+                    where: productWhere,
+                    skip,
+                    take: limit,
+                    orderBy: {updatedAt: 'desc'},
+                    include: {
+                        category: {select: {id: true, name: true}},
+                        subcategory: {select: {id: true, name: true}},
+                        shop: {select: {id: true, name: true, branchId: true}},
+                        images: {orderBy: [{isMain: 'desc'}, {order: 'asc'}], take: 2},
+                        variants: {
+                            where: {isActive: true},
+                            include: {
+                                inventories: {
+                                    where: targetBranchId ? {branchId: targetBranchId} : {},
+                                    select: {
+                                        id: true,
+                                        branchId: true,
+                                        physicalQty: true,
+                                        reservedQty: true,
+                                        threshold: true,
+                                        updatedAt: true,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                }),
+                prisma.product.count({where: productWhere}),
+            ]);
+
+            const items = products.map((prod) => {
+                let productPhysical = 0;
+                let productReserved = 0;
+                let productAvailable = 0;
+
+                const variants = prod.variants.map((v) => {
+                    const inv = v.inventories[0];
+                    const physical = inv?.physicalQty ?? 0;
+                    const reserved = inv?.reservedQty ?? 0;
+                    const threshold = inv?.threshold ?? 5;
+                    const available = Math.max(0, physical - reserved);
+
+                    productPhysical += physical;
+                    productReserved += reserved;
+                    productAvailable += available;
+
+                    return {
+                        id: v.id,
+                        inventoryId: inv?.id ?? null,
+                        sku: v.variantSku,
+                        variantName: v.variantName,
+                        finish: v.finish,
+
+                        physicalStock: physical,
+                        reservedStock: reserved,
+                        availableStock: available,
+                        threshold,
+                        isLowStock: available > 0 && available <= threshold,
+                        isOutOfStock: available <= 0,
+                        updatedAt: inv?.updatedAt ?? prod.updatedAt,
+                    };
+                });
+
+                // Status calculation
+                const isOutOfStock = variants.length > 0 && variants.every((v) => v.isOutOfStock);
+                const isLowStock = !isOutOfStock && variants.some((v) => v.isLowStock || v.isOutOfStock);
+
+                return {
+                    id: prod.id,
+                    name: prod.name,
+                    sku: prod.sku,
+                    category: prod.category.name,
+                    subcategory: prod.subcategory?.name ?? null,
+                    shop: prod.shop,
+                    sellingPrice: prod.sellingPrice,
+                    mrp: prod.mrp,
+                    mainImage: prod.images[0]?.url ?? null,
+                    physicalStock: productPhysical,
+                    reservedStock: productReserved,
+                    availableStock: productAvailable,
+                    totalVariants: variants.length,
+                    isOutOfStock,
+                    isLowStock,
+                    variants,
+                    updatedAt: prod.updatedAt,
+                };
+            });
+
+            // If a specific stock status filter is selected, filter items accordingly
+            let filteredItems = items;
+            if (status === 'in_stock') {
+                filteredItems = items.filter((i) => !i.isLowStock && !i.isOutOfStock && i.availableStock > 0);
+            } else if (status === 'low_stock') {
+                filteredItems = items.filter((i) => i.isLowStock);
+            } else if (status === 'out_of_stock') {
+                filteredItems = items.filter((i) => i.isOutOfStock);
+            }
+
+            return {
+                items: filteredItems,
+                pagination: {
+                    page,
+                    limit,
+                    total,
+                    totalPages: Math.ceil(total / limit),
+                },
+            };
+        }
+
+        // View === 'variant': flat list of variants
+        const variantWhere: Prisma.ProductVariantWhereInput = {
+            isActive: true,
+            product: baseProductWhere,
+            ...(search
+                ? {
+                      OR: [
+                          {variantSku: {contains: search, mode: 'insensitive'}},
+                          {barcode: search},
+                          {variantName: {contains: search, mode: 'insensitive'}},
+                          {finish: {contains: search, mode: 'insensitive'}},
+                          {product: {name: {contains: search, mode: 'insensitive'}}},
+                          {product: {sku: {contains: search, mode: 'insensitive'}}},
+                          {product: {productType: {contains: search, mode: 'insensitive'}}},
+                      ],
+                  }
+                : {}),
+        };
+
+        const [variants, total] = await Promise.all([
+            prisma.productVariant.findMany({
+                where: variantWhere,
+                skip,
+                take: limit,
+                orderBy: {createdAt: 'desc'},
+                include: {
+                    product: {
+                        select: {
+                            id: true,
+                            name: true,
+                            sku: true,
+                            mrp: true,
+                            sellingPrice: true,
+                            wholesalePrice: true,
+                            productKind: true,
+                            taxRate: true,
+                            hsnCode: true,
+                            shopId: true,
+                            category: {select: {id: true, name: true}},
+                            images: {where: {isMain: true}, take: 1, select: {url: true}},
+                        },
+                    },
+                    inventories: {
+                        where: targetBranchId ? {branchId: targetBranchId} : {},
+                        include: {
+                            branch: {select: {id: true, name: true, code: true}},
+                        },
+                    },
+                },
+            }),
+            prisma.productVariant.count({where: variantWhere}),
+        ]);
+
+        // GST at the tag price: the product's fixed rate, or its shop's price rule (D-18)
+        const ruleOf = await shopGstService.rulesOf(variants.map((v) => v.product.shopId));
+        const items = variants.map((v) => {
+            const inv = v.inventories[0];
+            const physical = inv?.physicalQty ?? 0;
+            const reserved = inv?.reservedQty ?? 0;
+            const threshold = inv?.threshold ?? 5;
+            const available = Math.max(0, physical - reserved);
+            const price = v.sellingPrice ?? v.product.sellingPrice ?? v.product.mrp;
+
+            return {
+                id: inv?.id ?? `v_${v.id}`,
+                variantId: v.id,
+                branch: inv?.branch ?? null,
+                product: {
+                    id: v.product.id,
+                    name: v.product.name,
+                    sku: v.product.sku,
+                    category: v.product.category.name,
+                    image: v.product.images[0]?.url ?? null,
+                    taxRate: rateFor(ruleOf(v.product.shopId), v.product.taxRate, price),
+                    /** null = follows the shop's GST rule */
+                    fixedTaxRate: v.product.taxRate,
+                    hsnCode: v.product.hsnCode,
+                    mrp: v.product.mrp,
+                },
+                variant: {
+                    id: v.id,
+                    sku: v.variantSku,
+                    variantName: v.variantName,
+                    finish: v.finish,
+                    barcode: v.barcode,
+                    // MRP printed on the tag; the POS shows it and the saving against it
+                    mrp: v.mrp ?? v.product.mrp,
+                    sellingPrice: v.sellingPrice ?? v.product.sellingPrice ?? v.product.mrp,
+                    // Dealer price for wholesale bills (falls back to the selling price)
+                    wholesalePrice:
+                        v.wholesalePrice ??
+                        (v.product.wholesalePrice || v.sellingPrice || v.product.sellingPrice || v.product.mrp),
+                    // This finish's own photo, else the product's
+                    image: v.image ?? v.product.images[0]?.url ?? null,
+                },
+                physicalStock: physical,
+                reservedStock: reserved,
+                availableStock: available,
+                threshold,
+                isLowStock: available > 0 && available <= threshold,
+                isOutOfStock: available <= 0,
+                updatedAt: inv?.updatedAt ?? v.createdAt,
+            };
+        });
+
+        let filteredItems = items;
+        if (status === 'in_stock') {
+            filteredItems = items.filter((i) => !i.isLowStock && !i.isOutOfStock && i.availableStock > 0);
+        } else if (status === 'low_stock') {
+            filteredItems = items.filter((i) => i.isLowStock);
+        } else if (status === 'out_of_stock') {
+            filteredItems = items.filter((i) => i.isOutOfStock);
+        }
+
+        return {
+            items: filteredItems,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit),
+            },
+        };
+    };
+
+    /**
+     * Adjust physical stock with validation against negative stock,
+     * recording audit logs, and keeping parent product stockQuantity in sync.
+     */
+    public adjustStock = async (scope: Scope, input: AdjustStockInput, performedById: string) => {
+        // Verify variant exists and is ours before resolving a branch from it
+        const variant = await prisma.productVariant.findUnique({
+            where: {id: input.variantId},
+            include: {
+                product: {
+                    select: {
+                        id: true,
+                        name: true,
+                        sku: true,
+                        companyId: true,
+                        shopId: true,
+                        shop: {select: {branchId: true}},
+                    },
+                },
+            },
+        });
+
+        if (!variant) {
+            throw new ApiError(httpStatus.NOT_FOUND, 'Product variant not found');
+        }
+        this.assertOwnVariants(scope, [variant]);
+
+        const branchId = await this.resolveBranchId(scope, input.branchId, input.variantId);
+
+        if (!['INCREASE', 'DECREASE', 'CORRECTION'].includes(input.type)) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Select an adjustment type');
+        }
+        // Validate quantity
+        const qty = Number(input.quantity);
+        if (!Number.isInteger(qty)) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Quantity must be a whole number');
+        }
+
+        if (input.type === 'CORRECTION') {
+            if (qty < 0) {
+                throw new ApiError(httpStatus.BAD_REQUEST, 'Stock quantity cannot be negative');
+            }
+        } else {
+            if (qty <= 0) {
+                throw new ApiError(httpStatus.BAD_REQUEST, 'Adjustment quantity must be greater than 0');
+            }
+        }
+
+        if (!input.reason?.trim()) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Reason is required for stock adjustment');
+        }
+
+        return prisma.$transaction(async (tx) => {
+            const [done] = await this.recordAdjustments(tx, {
+                branchId,
+                shopId: scope.shopId,
+                companyId: variant.product.companyId,
+                reason: input.reason.trim(),
+                notes: input.notes?.trim() || null,
+                performedById,
+                lines: [
+                    {
+                        variantId: input.variantId,
+                        productId: variant.productId,
+                        label: `"${variant.product.name}" (${variant.variantName})`,
+                        type: input.type,
+                        quantity: qty,
+                    },
+                ],
+            });
+            // A count that matches the system changes nothing and records nothing
+            const inv =
+                done?.inventory ??
+                (await tx.inventory.findUnique({
+                    where: {branchId_variantId: {branchId, variantId: input.variantId}},
+                }));
+            const physicalQty = inv?.physicalQty ?? 0;
+            return {
+                ...inv,
+                physicalQty,
+                availableStock: Math.max(0, physicalQty - (inv?.reservedQty ?? 0)),
+                diff: done ? done.availableAfter - done.availableBefore : 0,
+            };
+        });
+    };
+
+    /**
+     * Batch inward / outward stock adjustments for multiple variants at once.
+     */
+    public batchAdjust = async (scope: Scope, input: BatchAdjustInput, performedById: string) => {
+        const {type, reason, reference, items} = input;
+        if (type !== 'INCREASE' && type !== 'DECREASE') {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Select inward or outward');
+        }
+
+        // Filter valid items with quantity > 0
+        const validItems = (items || []).filter((item) => Number(item.quantity) > 0);
+        if (!validItems.length) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Please enter quantity greater than 0 for at least one item');
+        }
+        if (validItems.some((item) => !Number.isInteger(Number(item.quantity)))) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Quantity must be a whole number');
+        }
+        if (validItems.length > MAX_ADJUST_LINES) {
+            throw new ApiError(httpStatus.BAD_REQUEST, `Adjust at most ${MAX_ADJUST_LINES} items at a time`);
+        }
+
+        if (!reason?.trim()) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Reason is required for stock adjustment');
+        }
+
+        const variantIds = validItems.map((i) => i.variantId);
+        const variants = await prisma.productVariant.findMany({
+            where: {id: {in: variantIds}},
+            include: {
+                product: {
+                    select: {
+                        id: true,
+                        name: true,
+                        sku: true,
+                        companyId: true,
+                        shopId: true,
+                        shop: {select: {branchId: true}},
+                    },
+                },
+            },
+        });
+
+        if (variants.length !== validItems.length) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'One or more selected variants do not exist');
+        }
+        this.assertOwnVariants(scope, variants);
+
+        const branchId = await this.resolveBranchId(
+            scope,
+            input.branchId,
+            variants[0]?.id,
+        );
+
+        return prisma.$transaction(async (tx) => {
+            await this.recordAdjustments(tx, {
+                branchId,
+                shopId: scope.shopId,
+                companyId: variants[0].product.companyId,
+                reason: reason.trim(),
+                reference: reference?.trim() || null,
+                performedById,
+                lines: validItems.map((item) => {
+                    const v = variants.find((x) => x.id === item.variantId)!;
+                    return {
+                        variantId: v.id,
+                        productId: v.product.id,
+                        label: `"${v.product.name}" (${v.variantName}/${v.finish})`,
+                        type,
+                        quantity: Number(item.quantity),
+                    };
+                }),
+            });
+
+            return {
+                adjustedCount: validItems.length,
+                type,
+                reason,
+            };
+        }, LONG_ADJUST_TX);
+    };
+
+    /**
+     * Update low-stock threshold for a variant.
+     */
+    public updateThreshold = async (scope: Scope, input: UpdateThresholdInput) => {
+        const variant = await prisma.productVariant.findUnique({
+            where: {id: input.variantId},
+            select: {
+                product: {
+                    select: {companyId: true, shopId: true, shop: {select: {branchId: true}}},
+                },
+            },
+        });
+        if (!variant) {
+            throw new ApiError(httpStatus.NOT_FOUND, 'Product variant not found');
+        }
+        this.assertOwnVariants(scope, [variant]);
+
+        const branchId = await this.resolveBranchId(scope, input.branchId, input.variantId);
+        const threshold = Number(input.threshold);
+
+        if (isNaN(threshold) || threshold < 0) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Threshold must be a non-negative number');
+        }
+
+        const updated = await prisma.inventory.upsert({
+            where: {branchId_variantId: {branchId, variantId: input.variantId}},
+            create: {
+                branchId,
+                variantId: input.variantId,
+                physicalQty: 0,
+                reservedQty: 0,
+                threshold,
+            },
+            update: {
+                threshold,
+            },
+        });
+
+        return updated;
+    };
+
+    /**
+     * List stock movement history with full details and user information.
+     */
+    public movements = async (
+        scope: Scope,
+        params: {
+            branchId?: string;
+            productId?: string;
+            variantId?: string;
+            search?: string;
+            action?: 'INWARD' | 'OUTWARD' | 'ALL' | string;
+            type?: MovementType;
+            sourceType?: StockSourceType;
+            sourceId?: string;
+            page?: number;
+            limit?: number;
+        },
+    ) => {
+        const {
+            page = 1,
+            limit = 20,
+            branchId,
+            productId,
+            variantId,
+            search,
+            action,
+            type,
+            sourceType,
+            sourceId,
+        } = params;
+        const targetBranchId = scope.branchId || branchId;
+        const skip = (page - 1) * limit;
+
+        const inwardTypes: MovementType[] = [
+            'PURCHASE_IN',
+            'ADJUSTMENT_INCREASE',
+            'RETURN_RESTOCK',
+            'TRANSFER_IN',
+            'SALE_REVERSAL',
+        ];
+        const outwardTypes: MovementType[] = [
+            'SALE_OUT',
+            'ADJUSTMENT_DECREASE',
+            'DAMAGE_WRITE_OFF',
+            'TRANSFER_OUT',
+            'PURCHASE_REVERSAL',
+        ];
+
+        let typeFilter: Prisma.EnumMovementTypeFilter | MovementType | undefined = undefined;
+        if (type) {
+            typeFilter = type;
+        } else if (action === 'INWARD') {
+            typeFilter = {in: inwardTypes};
+        } else if (action === 'OUTWARD') {
+            typeFilter = {in: outwardTypes};
+        }
+
+        const where: Prisma.StockMovementWhereInput = {
+            ...(targetBranchId ? {branchId: targetBranchId} : {}),
+            ...(scope.companyId ? {branch: {companyId: scope.companyId}} : {}),
+            ...(variantId ? {variantId} : {}),
+            ...(productId ? {variant: {productId}} : {}),
+            ...(typeFilter ? {type: typeFilter} : {}),
+            ...(sourceType ? {sourceType} : {}),
+            ...(sourceId ? {sourceId} : {}),
+            ...(search
+                ? {
+                      OR: [
+                          {reason: {contains: search, mode: 'insensitive'}},
+                          {reference: {contains: search, mode: 'insensitive'}},
+                          {variant: {variantSku: {contains: search, mode: 'insensitive'}}},
+                          {variant: {product: {name: {contains: search, mode: 'insensitive'}}}},
+                      ],
+                  }
+                : {}),
+        };
+
+        const [items, total] = await Promise.all([
+            prisma.stockMovement.findMany({
+                where,
+                skip,
+                take: limit,
+                include: {
+                    branch: {select: {id: true, name: true, code: true}},
+                    variant: {
+                        select: {
+                            id: true,
+                            variantSku: true,
+                            variantName: true,
+                            finish: true,
+
+                            product: {
+                                select: {
+                                    id: true,
+                                    name: true,
+                                    sku: true,
+                                    images: {where: {isMain: true}, take: 1, select: {url: true}},
+                                },
+                            },
+                        },
+                    },
+                },
+                orderBy: {createdAt: 'desc'},
+            }),
+            prisma.stockMovement.count({where}),
+        ]);
+
+        // Enrich with user names
+        const userIds = [...new Set(items.map((m) => m.performedById).filter(Boolean))] as string[];
+        const users = userIds.length
+            ? await prisma.user.findMany({
+                  where: {id: {in: userIds}},
+                  select: {id: true, fullname: true, email: true},
+              })
+            : [];
+        const userMap = new Map(users.map((u) => [u.id, u]));
+
+        return {
+            items: items.map((m) => ({
+                id: m.id,
+                branch: m.branch,
+                product: m.variant.product,
+                variant: {
+                    id: m.variant.id,
+                    sku: m.variant.variantSku,
+                    variantName: m.variant.variantName,
+                    finish: m.variant.finish,
+
+                },
+                type: m.type,
+                quantity: m.quantity,
+                prevPhysical: m.prevPhysical,
+                newPhysical: m.newPhysical,
+                reason: m.reason,
+                reference: m.reference,
+                sourceType: m.sourceType,
+                sourceId: m.sourceId,
+                createdAt: m.createdAt,
+                performedBy: m.performedById ? userMap.get(m.performedById) ?? null : null,
+            })),
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit),
+            },
+        };
+    };
+}
+
+export default new InventoryService();

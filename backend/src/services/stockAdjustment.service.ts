@@ -1,0 +1,261 @@
+import prisma from '../client';
+import ApiError from '../utils/ApiError';
+import httpStatus from 'http-status';
+import { CreateAdjustmentInput, GetAdjustmentsQuery } from '../validations/stockAdjustment.validation';
+import { dayKey } from '../utils/day';
+import inventoryService from './inventory.service';
+
+export type Scope = {
+  companyId: string;
+  branchId: string;
+  shopId?: string;
+};
+
+class StockAdjustmentService {
+  /**
+   * Helper to resolve branchId
+   */
+  private async resolveBranchId(scope: Scope): Promise<string> {
+    if (scope.branchId) return scope.branchId;
+    if (scope.shopId) {
+      const shop = await prisma.shop.findUnique({
+        where: { id: scope.shopId },
+        select: { branchId: true },
+      });
+      if (shop?.branchId) return shop.branchId;
+    }
+    const firstBranch = await prisma.branch.findFirst({
+      where: { companyId: scope.companyId },
+      select: { id: true },
+    });
+    return firstBranch?.id || '';
+  }
+
+  /**
+   * Next adjustment number (a preview; the number is fixed when saved)
+   */
+  public async getNextAdjustmentNumber(scope: Scope) {
+    const branchId = await this.resolveBranchId(scope);
+    return { adjustmentNumber: await inventoryService.nextAdjustmentNumber(prisma, branchId) };
+  }
+
+  /**
+   * Get Variants for Adjustment Dropdown with current stock and damaged count
+   */
+  public async getAdjustmentVariants(scope: Scope, search?: string) {
+    const branchId = await this.resolveBranchId(scope);
+    const searchFilter = search ? search.trim().toLowerCase() : '';
+
+    const rows: any[] = await prisma.$queryRawUnsafe(`
+      SELECT 
+        v."id",
+        v."productId",
+        v."variantSku",
+        v."variantName",
+        v."finish",
+        p."name" as "productName",
+        COALESCE(i."physicalQty", 0)::int as "currentAvailable",
+        COALESCE(i."damagedQty", 0)::int as "damagedQty"
+      FROM "ProductVariant" v
+      JOIN "Product" p ON p."id" = v."productId"
+      LEFT JOIN "Shop" s ON s."id" = p."shopId"
+      LEFT JOIN "Inventory" i ON i."variantId" = v."id" AND i."branchId" = $1
+      WHERE p."companyId" = $2 AND p."deletedAt" IS NULL
+        AND CASE WHEN $3::text IS NULL THEN p."shopId" IS NULL OR s."branchId" = $1 ELSE p."shopId" = $3 END
+      ORDER BY p."name" ASC, v."variantName" ASC
+      LIMIT 50
+    `, branchId, scope.companyId, scope.shopId ?? null);
+
+    return {
+      variants: rows.map((r) => ({
+        id: r.id,
+        variantId: r.id,
+        productId: r.productId,
+        productName: r.productName,
+        variantName: r.variantName,
+        finish: r.finish,
+        sku: r.variantSku,
+        currentAvailable: Number(r.currentAvailable || 0),
+        damaged: Number(r.damagedQty || 0),
+        label: `${r.productName} · ${r.variantName} / ${r.finish}`,
+        subtext: `${r.variantSku} · current available: ${r.currentAvailable} · damaged: ${r.damagedQty}`,
+      })),
+    };
+  }
+
+  /**
+   * Get Adjustment History Table
+   */
+  public async getAdjustmentHistory(scope: Scope, query: GetAdjustmentsQuery) {
+    const branchId = await this.resolveBranchId(scope);
+    const typeFilter = query.type && query.type !== 'All types' && query.type !== 'ALL' ? query.type : undefined;
+
+    // A shop sees only its own products' adjustments (rows from the other stock screens carry no shopId)
+    let whereClause = `WHERE a."branchId" = $1 AND ($2::text IS NULL OR p."shopId" = $2)`;
+    if (typeFilter) {
+      if (typeFilter === 'Mark damaged' || typeFilter === 'MARK_DAMAGED') {
+        whereClause += ` AND a."type" = 'MARK_DAMAGED'`;
+      } else if (typeFilter === 'Count correction' || typeFilter === 'DECREASE') {
+        whereClause += ` AND a."type" = 'DECREASE'`;
+      } else if (typeFilter === 'Found stock' || typeFilter === 'INCREASE') {
+        whereClause += ` AND a."type" = 'INCREASE'`;
+      } else if (typeFilter === 'Write off' || typeFilter === 'WRITE_OFF') {
+        whereClause += ` AND a."type" = 'WRITE_OFF'`;
+      }
+    }
+
+    const rows: any[] = await prisma.$queryRawUnsafe(`
+      SELECT 
+        a."id",
+        a."adjustmentNumber" as "ref",
+        a."type",
+        a."quantity",
+        a."reason",
+        a."approvalStatus",
+        a."createdAt",
+        a."notes",
+        a."reference",
+        a."photoUrl",
+        v."variantName",
+        v."finish",
+        v."variantSku",
+        p."name" as "productName",
+        u."fullname" as "userName"
+      FROM "StockAdjustment" a
+      JOIN "ProductVariant" v ON v."id" = a."variantId"
+      JOIN "Product" p ON p."id" = v."productId"
+      LEFT JOIN "User" u ON u."id" = a."createdById"
+      ${whereClause}
+      ORDER BY a."createdAt" DESC, a."adjustmentNumber" DESC
+      LIMIT ${query.limit || 50}
+    `, branchId, scope.shopId ?? null);
+
+    const now = new Date();
+    const todayStr = dayKey(now);
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const yesterdayStr = dayKey(yesterday);
+
+    const history = rows.map((r) => {
+      const d = new Date(r.createdAt);
+      const dateStr = dayKey(d);
+      let displayDate = d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+
+      if (dateStr === todayStr) {
+        displayDate = 'Today';
+      } else if (dateStr === yesterdayStr) {
+        displayDate = 'Yesterday';
+      }
+
+      // Format display type
+      let displayType = 'Count correction';
+      let signedQty = -r.quantity;
+
+      if (r.type === 'MARK_DAMAGED') {
+        displayType = 'Mark damaged';
+        signedQty = -Math.abs(r.quantity);
+      } else if (r.type === 'INCREASE') {
+        displayType = 'Found stock';
+        signedQty = Math.abs(r.quantity);
+      } else if (r.type === 'WRITE_OFF') {
+        displayType = 'Write off';
+        signedQty = -Math.abs(r.quantity);
+      } else if (r.type === 'DECREASE') {
+        if (r.reason?.toLowerCase().includes('lost') || r.reason?.toLowerCase().includes('theft') || r.reason?.toLowerCase().includes('missing')) {
+          displayType = 'Lost / theft';
+        } else {
+          displayType = 'Count correction';
+        }
+        signedQty = -Math.abs(r.quantity);
+      }
+
+      // Determine actor name from notes if available e.g. "Logged by Shital Mane"
+      let byName = r.userName || '—';
+      if (r.notes && r.notes.includes('Logged by ')) {
+        byName = r.notes.replace('Logged by ', '').trim();
+      }
+
+      return {
+        id: r.id,
+        ref: r.ref || '—',
+        date: displayDate,
+        variantName: `${r.productName}`,
+        variantSubtext: `${r.variantName} / ${r.finish}`,
+        type: displayType,
+        typeKey: r.type,
+        qty: signedQty > 0 ? `+${signedQty}` : `${signedQty}`,
+        qtyRaw: signedQty,
+        reason: r.reason,
+        by: byName,
+        approvalStatus: r.approvalStatus || 'AUTO',
+        reference: r.reference,
+        photoUrl: r.photoUrl,
+      };
+    });
+
+    return { history };
+  }
+
+  /**
+   * Create Stock Adjustment
+   */
+  public async createAdjustment(scope: Scope, actorId: string, actorName: string, input: CreateAdjustmentInput) {
+    const branchId = await this.resolveBranchId(scope);
+    if (!branchId) throw new ApiError(httpStatus.BAD_REQUEST, 'Branch not found');
+
+    // Only the caller's own products: a shop its own, a branch its shops' and shop-less catalog ones
+    const variant = await prisma.productVariant.findFirst({
+      where: {
+        id: input.variantId,
+        product: {
+          companyId: scope.companyId,
+          deletedAt: null,
+          ...(scope.shopId
+            ? { shopId: scope.shopId }
+            : { OR: [{ shopId: null }, { shop: { branchId } }] }),
+        },
+      },
+      include: { product: { select: { name: true } } },
+    });
+    if (!variant) throw new ApiError(httpStatus.NOT_FOUND, 'Product variant not found');
+
+    const qty = input.quantity;
+    // Auto-approve rule: if mark damaged or count <= 2 -> AUTO, else APPROVED or PENDING
+    const approvalStatus = input.type === 'MARK_DAMAGED' || qty <= 2 ? 'AUTO' : 'APPROVED';
+
+    return prisma.$transaction(async (tx) => {
+      const [done] = await inventoryService.recordAdjustments(tx, {
+        branchId,
+        shopId: scope.shopId,
+        companyId: scope.companyId,
+        reason: input.reason,
+        reference: input.reference,
+        photoUrl: input.photoUrl,
+        notes: actorName ? `Logged by ${actorName}` : null,
+        approvalStatus,
+        performedById: actorId,
+        lines: [
+          {
+            variantId: input.variantId,
+            productId: variant.productId,
+            label: `"${variant.product.name}" (${variant.variantName})`,
+            type: input.type,
+            quantity: qty,
+          },
+        ],
+      });
+      const { adjustmentNumber, availableBefore, availableAfter, damagedBefore, damagedAfter } = done;
+
+      return {
+        success: true,
+        adjustmentNumber,
+        availableBefore,
+        availableAfter,
+        damagedBefore,
+        damagedAfter,
+        message: `Adjustment ${adjustmentNumber} created successfully for ${variant.product.name} (${variant.variantName}).`,
+      };
+    });
+  }
+}
+
+export default new StockAdjustmentService();

@@ -1,0 +1,360 @@
+import httpStatus from 'http-status';
+import {AccountStatus, BranchStatus, Prisma, Role} from '@prisma/client';
+import {z} from 'zod';
+import prisma from '../client';
+import {ApiError, encryptPassword} from '@utils/index';
+import {listArgs, searchWhere, toListResult} from '../utils/list';
+import {orgValidation} from '@validations/index';
+import accountService, {Scope} from './account.service';
+import auditService from './audit.service';
+import limitService from './limit.service';
+
+type CreateBranch = z.infer<typeof orgValidation.createBranchSchema>;
+// status is only set through setStatus (the form cannot change it)
+type UpdateBranch = z.infer<typeof orgValidation.updateBranchSchema> & {status?: BranchStatus};
+type BranchList = z.infer<typeof orgValidation.branchListSchema>;
+
+const ADMIN_FIELDS = {phone: 'adminPhone', email: 'adminEmail'};
+
+const BRANCH_LIST_INCLUDE = {
+    company: {select: {id: true, name: true, code: true}},
+    users: {
+        where: {role: Role.BRANCH_MANAGER, deletedAt: null},
+        select: {id: true, fullname: true, email: true, phoneNumber: true, status: true},
+        take: 1,
+    },
+    _count: {
+        select: {
+            users: {where: {role: Role.EMPLOYEE, deletedAt: null}},
+            shops: {where: {deletedAt: null}},
+        },
+    },
+} satisfies Prisma.BranchInclude;
+
+type BranchRow = Prisma.BranchGetPayload<{include: typeof BRANCH_LIST_INCLUDE}>;
+
+/** Flatten for the API: branchAdmin + counts instead of users/_count */
+const present = ({users, _count, ...branch}: BranchRow) => ({
+    ...branch,
+    branchAdmin: users[0] ?? null,
+    employeeCount: _count.users,
+    shopCount: _count.shops,
+});
+
+class BranchService {
+    private scopeWhere(scope: Scope, id?: string): Prisma.BranchWhereInput {
+        return {
+            ...(id ? {id} : {}),
+            deletedAt: null,
+            ...(scope.companyId ? {companyId: scope.companyId} : {}),
+            ...(scope.branchId ? {id: scope.branchId} : {}),
+        };
+    }
+
+    public async list(scope: Scope, query: BranchList) {
+        const where: Prisma.BranchWhereInput = {
+            ...this.scopeWhere(scope),
+            status: query.status,
+            // companyId filter only matters for the super admin (others are scoped)
+            ...(query.companyId && !scope.companyId ? {companyId: query.companyId} : {}),
+            OR: searchWhere(query.search, ['name', 'code', 'city', 'email'] as const),
+        };
+        const [items, total, active, inactive] = await prisma.$transaction([
+            prisma.branch.findMany({where, include: BRANCH_LIST_INCLUDE, ...listArgs(query)}),
+            prisma.branch.count({where}),
+            prisma.branch.count({where: {...this.scopeWhere(scope), status: BranchStatus.ACTIVE}}),
+            prisma.branch.count({
+                where: {...this.scopeWhere(scope), status: BranchStatus.INACTIVE},
+            }),
+        ]);
+        return {
+            ...toListResult(items.map(present), total, query),
+            summary: {total: active + inactive, active, inactive},
+        };
+    }
+
+    /** 404 for branches outside the scope: no probing other companies */
+    public async get(scope: Scope, id: string) {
+        const branch = await prisma.branch.findFirst({
+            where: this.scopeWhere(scope, id),
+            include: BRANCH_LIST_INCLUDE,
+        });
+        if (!branch) throw new ApiError(httpStatus.NOT_FOUND, 'Branch not found');
+        return present(branch);
+    }
+
+    /** Active branches of a company, for the employee form's branch picker */
+    public async options(companyId: string) {
+        return prisma.branch.findMany({
+            where: {companyId, deletedAt: null, status: BranchStatus.ACTIVE},
+            select: {id: true, name: true, code: true},
+            orderBy: {name: 'asc'},
+        });
+    }
+
+    /**
+     * The branch's outlet: billing, the cash drawer, products and staff are
+     * scoped to it. Exactly one per branch, made with the branch.
+     */
+    public async outletOf(branchId: string, db: Prisma.TransactionClient | typeof prisma = prisma) {
+        const shop = await db.shop.findFirst({
+            where: {branchId, deletedAt: null},
+            orderBy: {createdAt: 'asc'},
+            select: {id: true, code: true, name: true},
+        });
+        if (!shop) throw new ApiError(httpStatus.CONFLICT, 'This branch has no outlet set up');
+        return shop;
+    }
+
+    /** Make the outlet of a new branch (same name, address and contact) */
+    private async createOutlet(
+        tx: Prisma.TransactionClient,
+        branch: {id: string; code: string; companyId: string; name: string; address: string; email?: string | null; phone?: string | null},
+    ) {
+        return tx.shop.create({
+            data: {
+                code: `${branch.code}-S01`,
+                name: branch.name,
+                shopType: 'SHOWROOM',
+                companyId: branch.companyId,
+                branchId: branch.id,
+                address: branch.address,
+                email: branch.email ?? null,
+                phone: branch.phone ?? null,
+                billPrefix: branch.code.replace(/[^A-Z0-9]/gi, '').slice(-4).toUpperCase(),
+            },
+            select: {id: true},
+        });
+    }
+
+    public async create(companyId: string, data: CreateBranch, actorId: string) {
+        await limitService.assertCanAdd(companyId, 'branches');
+        const {adminName, adminEmail, adminPhone, adminPassword, ...fields} = data;
+        const withAdmin = !!adminName;
+        if (withAdmin && !adminPassword) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Admin Password is required', [
+                {field: 'adminPassword', message: 'Admin Password is required'},
+            ]);
+        }
+        if (withAdmin)
+            await accountService.ensureLoginIsFree(adminPhone, adminEmail, undefined, ADMIN_FIELDS);
+        const password = adminPassword ? await encryptPassword(adminPassword) : undefined;
+        const company = await prisma.company.findUniqueOrThrow({
+            where: {id: companyId},
+            select: {code: true},
+        });
+
+        const branch = await accountService.withRetry(
+            () =>
+                prisma.$transaction(async (tx) => {
+                    const code = await accountService.nextCode(
+                        tx,
+                        `${company.code}-B`,
+                        2,
+                        async (prefix) =>
+                            (
+                                await tx.branch.findMany({
+                                    where: {code: {startsWith: prefix}},
+                                    select: {code: true},
+                                })
+                            ).map((b) => b.code),
+                    );
+                    const created = await tx.branch.create({data: {...fields, code, companyId}});
+                    const outlet = await this.createOutlet(tx, created);
+                    if (withAdmin && password) {
+                        await limitService.assertCanAdd(companyId, 'employees', 1, tx);
+                        await tx.user.create({
+                            data: {
+                                fullname: adminName!,
+                                email: adminEmail,
+                                phoneNumber: adminPhone!,
+                                username: adminPhone,
+                                password,
+                                role: Role.BRANCH_MANAGER,
+                                companyId,
+                                branchId: created.id,
+                                shopId: outlet.id,
+                                isVerified: true,
+                                createdById: actorId,
+                            },
+                        });
+                    }
+                    return created;
+                }),
+            'code',
+        );
+        return this.get({companyId}, branch.id);
+    }
+
+    public async update(scope: Scope, id: string, data: UpdateBranch, actorId: string) {
+        const before = await this.get(scope, id);
+        const {adminName, adminEmail, adminPhone, adminPassword, ...fields} = data;
+        const admin = before.branchAdmin;
+
+        if (adminName && !admin && !adminPassword) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Admin Password is required', [
+                {
+                    field: 'adminPassword',
+                    message: 'Set a password to create the branch admin login',
+                },
+            ]);
+        }
+        if (adminName)
+            await accountService.ensureLoginIsFree(adminPhone, adminEmail, admin?.id, ADMIN_FIELDS);
+        const password = adminPassword ? await encryptPassword(adminPassword) : undefined;
+
+        if (adminName && !admin) await limitService.assertCanAdd(before.companyId, 'employees');
+
+        await prisma.$transaction(async (tx) => {
+            const updated = await tx.branch.update({where: {id}, data: fields});
+            const deactivated = updated.status !== BranchStatus.ACTIVE;
+            // The outlet follows the branch's name, contact and status
+            const outlet = await this.outletOf(id, tx).catch(() => null);
+            if (outlet) {
+                await tx.shop.update({
+                    where: {id: outlet.id},
+                    data: {
+                        name: updated.name,
+                        address: updated.address,
+                        email: updated.email,
+                        phone: updated.phone,
+                        status: deactivated ? 'INACTIVE' : 'ACTIVE',
+                    },
+                });
+            }
+            if (adminName) {
+                const login = {
+                    fullname: adminName,
+                    email: adminEmail,
+                    phoneNumber: adminPhone!,
+                    username: adminPhone,
+                };
+                // A new password ends the sessions signed in with the old one
+                const newPassword = password ? {password, refreshToken: null} : {};
+                if (admin) {
+                    await tx.user.update({where: {id: admin.id}, data: {...login, ...newPassword}});
+                } else if (password) {
+                    await tx.user.create({
+                        data: {
+                            ...login,
+                            password,
+                            role: Role.BRANCH_MANAGER,
+                            companyId: updated.companyId,
+                            branchId: id,
+                            shopId: outlet?.id ?? null,
+                            isVerified: true,
+                            createdById: actorId,
+                        },
+                    });
+                }
+            }
+            // A deactivated branch: its admin and employees are signed out
+            if (deactivated) {
+                await tx.user.updateMany({
+                    where: {branchId: id},
+                    data: {refreshToken: null, sessionsRevokedAt: new Date()},
+                });
+            }
+        });
+        return {before, after: await this.get(scope, id)};
+    }
+
+    public async setStatus(scope: Scope, id: string, status: BranchStatus, actorId: string) {
+        return this.update(scope, id, {status}, actorId);
+    }
+
+    /** Branch admin's own branch, for the branch profile page */
+    public async ofUser(branchId: string) {
+        return this.get({branchId}, branchId);
+    }
+
+    /** Is this an active branch of the company? (employee assignment) */
+    public async assertActiveInCompany(companyId: string, branchId: string) {
+        const branch = await prisma.branch.findFirst({
+            where: {id: branchId, companyId, deletedAt: null, status: BranchStatus.ACTIVE},
+            select: {id: true},
+        });
+        if (!branch) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Select an active branch of your company', [
+                {field: 'branchId', message: 'Select an active branch of your company'},
+            ]);
+        }
+    }
+
+    /**
+     * Branch for a company admin's new shop when none was picked: the only
+     * active branch, or a new Main Branch at the company's address when the
+     * business has no branches yet. null when there are several to pick from.
+     */
+    public async defaultBranchId(companyId: string, actorId: string): Promise<string | null> {
+        const branches = await prisma.branch.findMany({
+            where: {companyId, deletedAt: null},
+            select: {id: true, status: true},
+        });
+        const active = branches.filter((b) => b.status === BranchStatus.ACTIVE);
+        if (active.length === 1) return active[0].id;
+        if (active.length > 1) return null;
+        if (branches.length) {
+            throw new ApiError(
+                httpStatus.BAD_REQUEST,
+                'Activate a branch under Branches before adding a shop',
+            );
+        }
+        const company = await prisma.company.findUniqueOrThrow({
+            where: {id: companyId},
+            select: {address: true, postalCode: true, state: true, district: true, city: true},
+        });
+        // shortcut: two first-shop saves at the same instant could create two Main Branches, fine for one admin
+        const branch = await this.create(
+            companyId,
+            {
+                name: 'Main Branch',
+                address: company.address,
+                postalCode: company.postalCode,
+                state: company.state,
+                district: company.district ?? company.city,
+                city: company.city,
+                weeklyHolidays: [],
+                status: BranchStatus.ACTIVE,
+            },
+            actorId,
+        );
+        // A side effect of adding the first shop, so it gets its own audit row
+        await auditService.log({
+            actorId,
+            action: 'branch.create',
+            module: 'branches',
+            targetId: branch.id,
+            companyId,
+            reason: 'Main Branch made for the first shop',
+            after: branch,
+        });
+        return branch.id;
+    }
+
+    /** Counts used by dashboards */
+    public async counts(scope: Scope) {
+        const base = this.scopeWhere(scope);
+        const users = (role: Role, status?: AccountStatus) =>
+            prisma.user.count({
+                where: {
+                    role,
+                    deletedAt: null,
+                    status,
+                    ...(scope.companyId ? {companyId: scope.companyId} : {}),
+                    ...(scope.branchId ? {branchId: scope.branchId} : {}),
+                },
+            });
+        const [branches, activeBranches, branchAdmins, employees, activeEmployees] =
+            await Promise.all([
+                prisma.branch.count({where: base}),
+                prisma.branch.count({where: {...base, status: BranchStatus.ACTIVE}}),
+                users(Role.BRANCH_MANAGER),
+                users(Role.EMPLOYEE),
+                users(Role.EMPLOYEE, AccountStatus.ACTIVE),
+            ]);
+        return {branches, activeBranches, branchAdmins, employees, activeEmployees};
+    }
+}
+
+export default new BranchService();

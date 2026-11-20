@@ -1,0 +1,118 @@
+import {CreditNoteStatus, ReturnSettlement} from '@prisma/client';
+import prisma from '../client';
+import companySettingsService from './companySettings.service';
+import {BranchScope} from './customerDue.service';
+
+export type ApprovalItem = {
+    id: string;
+    type: 'REFUND';
+    title: string;
+    description: string;
+    shopAndStaff: string;
+    amountLabel: string;
+    amount: number;
+    status: 'PENDING' | 'APPROVED' | 'REJECTED';
+    decisionNote?: string;
+    decisionDate?: string;
+};
+
+/*
+ * The branch admin's approval queue, built from real requests. Today the one
+ * action the shops hand up to the branch is a refund credit note (any cash
+ * refund, or one above the approval limit). It is decided through the credit
+ * note decision (POST /credit-notes/:id/decision), which is audited.
+ */
+
+const rupees = (n: number) => `₹${n.toLocaleString('en-IN')}`;
+
+const ago = (d: Date) => {
+    const mins = Math.round((Date.now() - d.getTime()) / 60_000);
+    if (mins < 60) return `${Math.max(mins, 1)} min ago`;
+    if (mins < 24 * 60) return `${Math.round(mins / 60)} h ago`;
+    return d.toLocaleDateString('en-IN', {day: '2-digit', month: 'short'});
+};
+
+const REASON: Record<string, string> = {
+    DEFECTIVE: 'Defective',
+    DAMAGED_IN_TRANSIT: 'Damaged in transit',
+    WRONG_ITEM: 'Wrong item',
+    NOT_AS_DESCRIBED: 'Not as described',
+    CHANGED_MIND: 'Changed mind',
+    OTHER: 'Other',
+};
+
+class BranchApprovalService {
+    public async getApprovals(scope: BranchScope, tab?: string) {
+        const startOfDay = new Date();
+        startOfDay.setHours(0, 0, 0, 0);
+        const base = {
+            companyId: scope.companyId,
+            branchId: scope.branchId,
+            settlement: ReturnSettlement.REFUND,
+            needsApproval: true,
+        };
+        const pendingWhere = {...base, status: CreditNoteStatus.PENDING_APPROVAL};
+        const doneWhere = {
+            ...base,
+            status: {not: CreditNoteStatus.PENDING_APPROVAL},
+            decidedAt: {gte: startOfDay},
+        };
+
+        const [pending, doneToday] = await Promise.all([prisma.creditNote.count({where: pendingWhere}), prisma.creditNote.count({where: doneWhere})]);
+
+        const showDone = tab === 'DONE_TODAY';
+        // Refund credit notes are the only requests the shops hand up to the branch
+        const notes =
+            !tab || tab === 'REFUND' || showDone
+                ? await prisma.creditNote.findMany({
+                      where: showDone ? doneWhere : pendingWhere,
+                      orderBy: {createdAt: 'asc'},
+                      include: {
+                          shop: {select: {name: true}},
+                          createdBy: {select: {fullname: true}},
+                          salesBill: {select: {billNumber: true}},
+                          items: {select: {productName: true, variantName: true, quantity: true}},
+                      },
+                  })
+                : [];
+
+        const items: ApprovalItem[] = notes.map((n) => ({
+            id: n.id,
+            type: 'REFUND',
+            title: `${n.noteNumber} · ${n.salesBill.billNumber}`,
+            description: [
+                n.items.map((i) => `${i.productName ?? 'Item'}${i.variantName ? ` ${i.variantName}` : ''} ×${i.quantity}`).join(', '),
+                `${REASON[n.reason] ?? n.reason}${n.reasonNote ? ` — ${n.reasonNote}` : ''}`,
+                `Refund by ${n.refundMode ?? 'cash'}${n.customerName ? ` to ${n.customerName}` : ''}`,
+            ].join(' · '),
+            shopAndStaff: `${n.shop.name} · ${n.createdBy.fullname} · ${ago(n.createdAt)}`,
+            amountLabel: rupees(n.totalAmount),
+            amount: n.totalAmount,
+            status:
+                n.status === CreditNoteStatus.PENDING_APPROVAL
+                    ? 'PENDING'
+                    : n.status === CreditNoteStatus.APPROVED
+                      ? 'APPROVED'
+                      : 'REJECTED',
+            decisionNote: n.decisionNote ?? undefined,
+            decisionDate: n.decidedAt?.toISOString(),
+        }));
+
+        const {refundApprovalLimit} = await companySettingsService.get(scope.companyId);
+        return {
+            counts: {pending, refund: pending, doneToday},
+            items,
+            // The rules the system actually enforces (the company's settings, P4-08)
+            limitsTable: [
+                {
+                    action: 'Refund (credit note)',
+                    cashierCan: `Card / UPI up to ${rupees(refundApprovalLimit)}`,
+                    managerCan: `Card / UPI up to ${rupees(refundApprovalLimit)}`,
+                    aboveThat: 'Branch Admin (and every cash refund)',
+                },
+            ],
+        };
+    }
+}
+
+export default new BranchApprovalService();

@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  background: #f7f3ee;
+  color: #1f1d1b;
+  -webkit-font-smoothing: antialiased;
+}
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+/* Small text buttons and links: a finger-sized touch area (about 36px) without changing the layout */
+@layer components {
+  .tap {
+    @apply -my-2.5 py-2.5;
+  }
+}
+
+/* Headings use Fraunces; keep them crisp and slightly tighter */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.01em;
+}
+:focus-visible {
+  outline: 2px solid #c08a3e;
+  outline-offset: 2px;
+}

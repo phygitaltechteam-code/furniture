@@ -1,0 +1,187 @@
+import httpStatus from 'http-status';
+import {Prisma, Role} from '@prisma/client';
+import {z} from 'zod';
+import prisma from '../client';
+import {ApiError, encryptPassword} from '@utils/index';
+import {listArgs, searchWhere, toListResult} from '../utils/list';
+import {orgValidation} from '@validations/index';
+import accountService, {SAFE_USER, Scope} from './account.service';
+import shopService from './shop.service';
+import branchService from './branch.service';
+import limitService from './limit.service';
+
+type CreateEmployee = z.infer<typeof orgValidation.createEmployeeSchema>;
+type UpdateEmployee = z.infer<typeof orgValidation.updateEmployeeSchema>;
+type EmployeeList = z.infer<typeof orgValidation.employeeListSchema>;
+
+/**
+ * Employees of a company (company admin) or of one branch (branch admin).
+ * Every employee works in a shop; their branch is always the shop's branch.
+ */
+class EmployeeService {
+    private scopeWhere(scope: Scope, id?: string): Prisma.UserWhereInput {
+        return {
+            ...(id ? {id} : {}),
+            role: Role.EMPLOYEE,
+            deletedAt: null,
+            companyId: scope.companyId,
+            ...(scope.branchId ? {branchId: scope.branchId} : {}),
+            ...(scope.shopId ? {shopId: scope.shopId} : {}),
+        };
+    }
+
+    public async list(scope: Scope, query: EmployeeList) {
+        const where: Prisma.UserWhereInput = {
+            ...this.scopeWhere(scope),
+            status: query.status,
+            ...(query.branchId && !scope.branchId ? {branchId: query.branchId} : {}),
+            ...(query.shopId && !scope.shopId ? {shopId: query.shopId} : {}),
+            OR: searchWhere(query.search, [
+                'fullname',
+                'email',
+                'phoneNumber',
+                'employeeCode',
+                'employeeRole',
+                'jobTitle',
+            ] as const),
+        };
+        const [items, total] = await prisma.$transaction([
+            prisma.user.findMany({where, select: SAFE_USER, ...listArgs(query)}),
+            prisma.user.count({where}),
+        ]);
+        return toListResult(items, total, query);
+    }
+
+    /** 404 outside the scope, so other companies' staff cannot be probed */
+    public async get(scope: Scope, id: string) {
+        const employee = await prisma.user.findFirst({
+            where: this.scopeWhere(scope, id),
+            select: SAFE_USER,
+        });
+        if (!employee) throw new ApiError(httpStatus.NOT_FOUND, 'Employee not found');
+        return employee;
+    }
+
+    /**
+     * Employees work in a branch (its outlet). Branch managers always add to
+     * their own branch; the admin picks the branch. Returns outlet + branch.
+     */
+    private async resolveShop(scope: Scope, requested?: string, branchId?: string) {
+        let shopId = scope.shopId ?? requested;
+        const branch = scope.branchId ?? branchId;
+        if (!shopId && branch) shopId = (await branchService.outletOf(branch)).id;
+        if (!shopId) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Branch is required', [
+                {field: 'branchId', message: 'Branch is required'},
+            ]);
+        }
+        const shop = await shopService.assertActiveInScope(scope, shopId);
+        if (branchId && branchId !== shop.branchId) {
+            throw new ApiError(httpStatus.BAD_REQUEST, 'Select a branch of your company', [
+                {field: 'branchId', message: 'Select a branch of your company'},
+            ]);
+        }
+        return {shopId: shop.id, branchId: shop.branchId};
+    }
+
+    public async create(scope: Scope, data: CreateEmployee, actorId: string) {
+        await limitService.assertCanAdd(scope.companyId!, 'employees');
+        const {shopId, branchId} = await this.resolveShop(scope, data.shopId, data.branchId);
+        await accountService.ensureLoginIsFree(data.phoneNumber, data.email);
+        const password = await encryptPassword(data.password);
+        const company = await prisma.company.findUniqueOrThrow({
+            where: {id: scope.companyId},
+            select: {code: true},
+        });
+
+        const created = await accountService.withRetry(
+            () =>
+                prisma.$transaction(async (tx) => {
+                    const employeeCode = await accountService.nextCode(
+                        tx,
+                        `${company.code}-E`,
+                        3,
+                        async (prefix) =>
+                            (
+                                await tx.user.findMany({
+                                    where: {employeeCode: {startsWith: prefix}},
+                                    select: {employeeCode: true},
+                                })
+                            ).map((u) => u.employeeCode ?? ''),
+                    );
+                    return tx.user.create({
+                        data: {
+                            fullname: data.fullname,
+                            email: data.email,
+                            phoneNumber: data.phoneNumber,
+                            username: data.phoneNumber,
+                            password,
+                            // The admin chose it: the employee replaces it at first sign-in (P2-07)
+                            mustChangePassword: true,
+                            role: Role.EMPLOYEE,
+                            companyId: scope.companyId,
+                            branchId,
+                            shopId,
+                            employeeCode,
+                            employeeRole: data.employeeRole,
+                            jobTitle: data.jobTitle,
+                            department: data.department,
+                            joiningDate: data.joiningDate,
+                            permissions: data.permissions,
+                            isVerified: true,
+                            createdById: actorId,
+                        },
+                        select: {id: true},
+                    });
+                }),
+            'employeeCode',
+        );
+        return this.get(scope, created.id);
+    }
+
+    public async update(scope: Scope, id: string, data: UpdateEmployee) {
+        const before = await this.get(scope, id);
+        const {
+            password: newPassword,
+            branchId: requestedBranch,
+            shopId: requestedShop,
+            ...fields
+        } = data;
+
+        // Moving to another branch (the admin only; branch managers see their own branch)
+        const moving =
+            !scope.branchId &&
+            ((requestedBranch && requestedBranch !== before.branchId) ||
+                (requestedShop && requestedShop !== before.shopId));
+        const target = moving
+            ? await this.resolveShop(scope, requestedShop, requestedBranch ?? undefined)
+            : undefined;
+        const shopId = target?.shopId;
+        const branchId = target && target.branchId !== before.branchId ? target.branchId : undefined;
+        await accountService.ensureLoginIsFree(fields.phoneNumber, fields.email, id);
+
+        const permissionsChanged =
+            fields.permissions &&
+            fields.permissions.slice().sort().join() !== before.permissions.slice().sort().join();
+        const password = newPassword ? await encryptPassword(newPassword) : undefined;
+
+        await prisma.user.update({
+            where: {id},
+            data: {
+                ...fields,
+                ...(fields.phoneNumber ? {username: fields.phoneNumber} : {}),
+                ...(shopId ? {shopId} : {}),
+                ...(branchId ? {branchId} : {}),
+                // A password the admin set is replaced at the next sign-in (P2-07)
+                ...(password ? {password, mustChangePassword: true} : {}),
+                // New password, other branch or other permissions: sign in again
+                ...(password || branchId || permissionsChanged
+                    ? {refreshToken: null, sessionsRevokedAt: new Date()}
+                    : {}),
+            },
+        });
+        return {before, after: await this.get(scope, id)};
+    }
+}
+
+export default new EmployeeService();

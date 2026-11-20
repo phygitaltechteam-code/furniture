@@ -1,0 +1,282 @@
+import {PageHeader} from '@/components/ui';
+import {
+  useMarkAttendance,
+  useStaff,
+  useStaffRequests,
+  useUpdateStaffRights,
+  useUpdateStaffShift,
+} from '@/lib/react-query/queriesAndMutations/staff';
+import {AttendanceStatus, SHIFT_LABEL, Shift, StaffMember} from '@/types/staff';
+import {getErrorMessage} from '@/utils/axios';
+import {Link} from '@tanstack/react-router';
+import {useEffect, useRef, useState} from 'react';
+
+type Props = {panel?: string};
+
+const initials = (name: string) =>
+  name
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((n) => n[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
+
+const clock = (iso: string) => {
+  const d = new Date(iso);
+  return `${d.getHours() % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+const nowHHMM = () => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+const PILL = {
+  green: 'bg-[#E3EEDD] text-[#3F6B3A]',
+  amber: 'bg-[#F6E6C8] text-[#8A5A12]',
+  muted: 'bg-[#EFE6DC] text-[#7A6A5C]',
+  red: 'bg-[#F1E7DF] text-[#9B2C2C]',
+};
+
+/** The "Today" pill: in / out / on leave, or when the shift starts */
+const todayPill = (s: StaffMember): {label: string; tone: keyof typeof PILL} => {
+  const a = s.attendance;
+  if (a?.status === 'IN') return {label: a.inAt ? `In ${clock(a.inAt)}` : 'In', tone: 'green'};
+  if (a?.status === 'OUT') return {label: a.outAt ? `Out ${clock(a.outAt)}` : 'Out', tone: 'muted'};
+  if (a?.status === 'LEAVE') return {label: 'On leave', tone: 'amber'};
+  if (a?.status === 'ABSENT') return {label: 'Absent', tone: 'red'};
+  if (s.shiftHours.start > nowHHMM()) return {label: `From ${s.shiftHours.start}`, tone: 'muted'};
+  return {label: 'Not in', tone: 'muted'};
+};
+
+const ATTENDANCE_ACTIONS: Array<{status: AttendanceStatus; label: string}> = [
+  {status: 'IN', label: 'Mark in'},
+  {status: 'OUT', label: 'Mark out'},
+  {status: 'LEAVE', label: 'On leave'},
+  {status: 'ABSENT', label: 'Absent'},
+];
+
+function TodayCell({member, panel}: {member: StaffMember; panel: string}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const mark = useMarkAttendance(panel);
+  const pill = todayPill(member);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative inline-block">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={mark.isPending}
+        className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${PILL[pill.tone]}`}
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-current" />
+        {pill.label}
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute left-0 z-30 mt-1 w-32 border border-ivory-300 bg-white py-1 shadow-lg"
+        >
+          {ATTENDANCE_ACTIONS.filter(
+            (a) => a.status !== member.attendance?.status && (a.status !== 'OUT' || member.attendance?.status === 'IN'),
+          ).map((a) => (
+            <button
+              key={a.status}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                mark.mutate({id: member.id, status: a.status});
+              }}
+              className="block w-full px-3 py-1.5 text-left text-body-sm text-espresso hover:bg-ivory-100"
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const REQUEST_PILL: Record<string, string> = {
+  PENDING: PILL.amber,
+  APPROVED: PILL.green,
+  REJECTED: PILL.red,
+};
+
+export default function StaffRightsPage({panel = 'shop-admin'}: Props) {
+  const {data, isLoading, isError, error, refetch} = useStaff(panel);
+  const {data: requests} = useStaffRequests(panel);
+  const updateRights = useUpdateStaffRights(panel);
+  const updateShift = useUpdateStaffShift(panel);
+  const rights = data?.rights ?? [];
+
+  const toggle = (member: StaffMember, key: string) => {
+    const permissions = member.permissions.includes(key)
+      ? member.permissions.filter((p) => p !== key)
+      : [...member.permissions, key];
+    updateRights.mutate({id: member.id, permissions});
+  };
+
+  return (
+    <div>
+      <PageHeader
+        breadcrumbs={[{label: 'Branch'}, {label: 'Staff'}]}
+        title="Staff & rights"
+        subtitle="Your team's shifts and today's activity. A tick gives that module with edit access; set View-only access on the Employees page."
+        actions={
+          // New staff get their login on the Employees page, straight away
+          <Link to="/shop-admin/employees" className="btn-ghost">
+            Add staff
+          </Link>
+        }
+      />
+
+      <section className="panel">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[920px] border-collapse text-left">
+            <thead>
+              <tr className="border-b border-ivory-300 text-[10px] font-bold uppercase tracking-wider text-on-surface-variant">
+                <th scope="col" className="px-4 py-3">Staff</th>
+                <th scope="col" className="px-3 py-3">Role</th>
+                <th scope="col" className="px-3 py-3">Shift</th>
+                <th scope="col" className="px-3 py-3">Today</th>
+                {/* Twelve modules: long names wrap onto two lines so the table fits */}
+                {rights.map((r) => (
+                  <th key={r.key} scope="col" className="w-16 px-1.5 py-3 text-center leading-tight">
+                    {r.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ivory-200 text-body-sm text-espresso">
+              {isLoading && (
+                <tr>
+                  <td colSpan={4 + rights.length} className="px-4 py-10 text-center text-outline">
+                    Loading staff…
+                  </td>
+                </tr>
+              )}
+              {isError && (
+                <tr>
+                  <td colSpan={4 + rights.length} className="px-4 py-10 text-center text-error">
+                    {getErrorMessage(error, 'Could not load staff')}{' '}
+                    <button type="button" className="btn-text" onClick={() => refetch()}>
+                      Retry
+                    </button>
+                  </td>
+                </tr>
+              )}
+              {data && !data.items.length && (
+                <tr>
+                  <td colSpan={4 + rights.length} className="px-4 py-10 text-center text-outline">
+                    No staff in this branch yet. Add staff to get started.
+                  </td>
+                </tr>
+              )}
+              {data?.items.map((s) => (
+                <tr key={s.id} className="hover:bg-ivory-50">
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-3">
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blush/50 text-[11px] font-semibold text-burgundy">
+                        {initials(s.fullname)}
+                      </span>
+                      <div className="min-w-0">
+                        <p className="whitespace-nowrap font-medium leading-tight">{s.fullname}</p>
+                        <p className="whitespace-nowrap text-[11px] text-outline">{s.employeeCode ?? '—'}</p>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-3 py-3">{s.role}</td>
+                  <td className="px-3 py-3">
+                    <label className="sr-only" htmlFor={`shift-${s.id}`}>
+                      Shift of {s.fullname}
+                    </label>
+                    <select
+                      id={`shift-${s.id}`}
+                      value={s.shift}
+                      disabled={updateShift.isPending}
+                      onChange={(e) => updateShift.mutate({id: s.id, shift: e.target.value as Shift})}
+                      className="cursor-pointer border border-transparent bg-transparent py-1 pr-1 text-body-sm hover:border-ivory-300 focus:border-burgundy focus:outline-none"
+                    >
+                      {(Object.keys(SHIFT_LABEL) as Shift[]).map((k) => (
+                        <option key={k} value={k}>
+                          {SHIFT_LABEL[k]}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="px-3 py-3">
+                    <TodayCell member={s} panel={panel} />
+                  </td>
+                  {rights.map((r) => (
+                    <td key={r.key} className="px-1.5 py-3 text-center">
+                      <input
+                        type="checkbox"
+                        aria-label={`${r.label} for ${s.fullname}`}
+                        title={s.isManager ? 'The branch manager has every right' : undefined}
+                        className="h-4 w-4 cursor-pointer accent-[#5B3A29] disabled:cursor-not-allowed"
+                        checked={s.permissions.includes(r.key)}
+                        disabled={s.isManager}
+                        onChange={() => toggle(s, r.key)}
+                      />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {data && (
+          <p className="border-t border-ivory-300 px-4 py-3 text-body-sm text-outline">
+            {data.summary.total} staff · {data.summary.in} in today · {data.summary.onLeave} on leave.
+            Ticking a box saves it straight away.
+          </p>
+        )}
+      </section>
+
+      {!!requests?.length && (
+        <section className="panel mt-6">
+          <h2 className="border-b border-ivory-300 px-4 py-3 font-serif text-headline-sm text-burgundy">
+            Earlier staff requests
+          </h2>
+          <ul className="divide-y divide-ivory-200">
+            {requests.map((r) => (
+              <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-body-sm">
+                <div>
+                  <p className="font-medium text-espresso">
+                    {r.fullname} · {r.employeeRole} · {SHIFT_LABEL[r.shift] ?? r.shift}
+                  </p>
+                  <p className="text-[11px] text-outline">
+                    {r.requestNumber} · {r.phoneNumber} · {new Date(r.createdAt).toLocaleDateString('en-IN')}
+                    {r.decisionNote ? ` · ${r.decisionNote}` : ''}
+                  </p>
+                </div>
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${REQUEST_PILL[r.status]}`}
+                >
+                  <span className="h-1.5 w-1.5 rounded-full bg-current" />
+                  {r.status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </div>
+  );
+}
